@@ -4,7 +4,7 @@ import { TransitService } from '../services/transitService';
 import { useParams, useNavigate } from 'react-router-dom';
 import { MapPin, Navigation } from 'lucide-react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faSearch, faMapPin, faArrowUp, faArrowDown, faChevronUp, faExclamationCircle, faExclamationTriangle, faArrowsAltV, faCalendarAlt, faTimes, faBus, faLocationArrow, faTram, faShip, faBan, faStar, faTrash, faWalking, faTaxi, faFilter, faChevronLeft, faChevronRight, faInfoCircle, faClock, faGlobe, faMap, faTrain, faSubway, faMapMarkerAlt, faLocationDot, faSearchPlus, faSearchMinus } from '@fortawesome/free-solid-svg-icons';
+import { faSearch, faMapPin, faArrowUp, faArrowDown, faChevronUp, faExclamationCircle, faExclamationTriangle, faArrowsAltV, faCalendarAlt, faTimes, faBus, faLocationArrow, faTram, faShip, faBan, faStar, faTrash, faWalking, faTaxi, faFilter, faChevronLeft, faChevronRight, faInfoCircle, faGlobe, faMap, faTrain, faSubway, faMapMarkerAlt, faLocationDot, faSearchPlus, faSearchMinus } from '@fortawesome/free-solid-svg-icons';
 import { DepartureSkeleton, ThemedSpinner } from './Loaders';
 
 import { WeatherDisplay } from './WeatherDisplay';
@@ -12,8 +12,9 @@ import { useAlarms } from '../hooks/useAlarms';
 
 const DepartureRouteMap = React.lazy(() => import('./DepartureRouteMap').then(module => ({ default: module.DepartureRouteMap })));
 const TripPlanner = React.lazy(() => import('./TripPlanner').then(module => ({ default: module.TripPlanner })));
-import { MonitorTripButton } from './MonitorTripButton';
 import { DepartureDetailsModal } from './DepartureDetailsModal';
+import { useToast } from './ToastProvider';
+import { faShareAlt } from '@fortawesome/free-solid-svg-icons';
 
 interface DeparturesBoardProps {
   initialStation?: Station;
@@ -91,9 +92,13 @@ const DepartureRow = React.memo(({
             </div>
           </div>
 
-          {/* Watch Button */}
-          <div className="mr-2">
-            <MonitorTripButton departure={dep} />
+          {/* Watch Button & Disruption */}
+          <div className="mr-2 flex items-center gap-2">
+            {dep.hasDisruption && (
+              <div className="text-amber-500" title={dep.disruptionMessage || "Trafikstörning"}>
+                <FontAwesomeIcon icon={faExclamationTriangle} />
+              </div>
+            )}
           </div>
 
           {/* Time & Track */}
@@ -112,8 +117,19 @@ const DepartureRow = React.memo(({
               )}
             </div>
 
-            <div className={`w-10 font-bold ${isDense ? 'text-xs' : 'text-sm'} text-slate-600 dark:text-slate-300`}>
-              {dep.track}
+            <div className="w-10 flex justify-end">
+              {dep.track && dep.track !== 'X' && dep.track !== '' ? (
+                <div
+                  className={`w-6 h-6 rounded-full flex items-center justify-center font-black text-[10px] select-none shadow-sm ${
+                    isCancelled
+                      ? 'bg-red-600 text-red-100'
+                      : 'bg-slate-950 dark:bg-black text-slate-400 border border-slate-800 dark:border-slate-700'
+                  }`}
+                  title={`Läge ${dep.track}`}
+                >
+                  {dep.track.length > 2 ? dep.track.slice(0, 2) : dep.track}
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
@@ -280,12 +296,11 @@ const JourneyTimeline = ({ stops, type, currentStationName }: { stops: JourneyDe
   )
 };
 
-import { useToast } from './ToastProvider';
 
 export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation, mode = 'departures' }) => {
   const toast = useToast();
   const { addAlarm, alarms } = useAlarms();
-  const { stationId } = useParams();
+  const { stationId: paramStationId, provider: paramProvider } = useParams<{ stationId: string, provider: string }>();
   const navigate = useNavigate();
 
   // View Mode State (Station vs Trip Planner)
@@ -295,48 +310,11 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
   const [query, setQuery] = useState('');
   const [station, setStation] = useState<Station | null>(initialStation || null);
 
-  // Sync station with URL
-  useEffect(() => {
-    if (stationId && (!station || station.id !== stationId)) {
-      // If we have an ID but no station object (or mismatch), we need to fetch/create it.
-      // Since we don't have a direct "getStationById" that returns full name/coords easily for all providers,
-      // we might need to rely on what we can get. 
-      // For now, let's try to mock a station object or use a service if available.
-      // Or, better, assume we might need to fetch departures to confirm station name if not known.
-      // A simple workaround: Create a dummy station with the ID and let the fetchDepartures logic handle it.
-      // If fetchDepartures returns data, we can potentialy extract the real station name from the first departure's stopPoint.
-
-      const potentialProvider = (localStorage.getItem('resmus_storage_provider') as Provider) || Provider.VASTTRAFIK;
-
-      // Attempt to set a temporary station object
-      setStation({
-        id: stationId,
-        name: "Laddar station...", // Placeholder
-        provider: potentialProvider,
-        coords: { lat: 0, lng: 0 }
-      });
-      // The main fetch effect will trigger on 'station' change. 
-      // We might want to refine the name later if possible.
-    } else if (!stationId && station && location.pathname === '/') {
-      // If we navigated to root and had a station, maybe keep it or clear it? 
-      // User behavior: if they click "Avgångar" (root), they might expect reset. 
-      // For now, let's not clear it aggressively unless explicit.
-    }
-  }, [stationId]);
-
-  // Update existing handleSelectStation to navigate
-  const handleSelectStation = (s: Station) => {
-    setStation(s);
-    setQuery('');
-    setSearchResults([]);
-    setDepartures([]);
-    navigate(`/station/${s.id}`, { replace: true });
-  };
   const [provider, setProvider] = useState<Provider>(() => {
-    return (localStorage.getItem('resmus_storage_provider') as Provider) || Provider.VASTTRAFIK;
+    const saved = localStorage.getItem('resmus_storage_provider') as Provider | null;
+    return saved || Provider.VASTTRAFIK;
   });
 
-  // Effect moved below state declarations
   const [departures, setDepartures] = useState<Departure[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -345,9 +323,8 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
 
   const [viewMode, setViewMode] = useState<'departures' | 'arrivals'>(mode);
   const [sortMode, setSortMode] = useState<'time' | 'line'>('time');
-  const [timeDisplayMode, setTimeDisplayMode] = useState<'minutes' | 'clock'>('clock');
+  const [timeDisplayMode, setTimeDisplayMode] = useState<'minutes' | 'clock'>('minutes'); // Default to minutes for better UX
   const [isDense, setIsDense] = useState(false);
-
 
   const [customTime, setCustomTime] = useState<string>(''); // YYYY-MM-DDTHH:MM
   const [timeWindow, setTimeWindow] = useState(() => parseInt(localStorage.getItem('resmus_time_span') || '240', 10)); // Default 4 hours
@@ -355,7 +332,6 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [locationError, setLocationError] = useState<string | null>(null);
 
-  // --- MOVED STATE UP TO FIX REFERENCE ERROR ---
   // Check for station-based disruptions and withdrawals
   const [stationDisruptions, setStationDisruptions] = useState<any[]>([]);
   const [withdrawnLines, setWithdrawnLines] = useState<Set<string>>(new Set());
@@ -379,15 +355,45 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
   // Track mount status for provider change logic
   const isMountedRef = React.useRef(false);
 
-  // Clear station when provider changes (to prevent data mismatch)
+  // Handle Select Station
+  const handleSelectStation = (s: Station) => {
+    setStation(s);
+    setQuery('');
+    setSearchResults([]);
+    setDepartures([]);
+    navigate(`/station/${s.provider.toLowerCase()}/${s.id}`, { replace: true });
+  };
+
+  // Sync station from URL
   useEffect(() => {
-    if (isMountedRef.current) {
-      setStation(null);
-      setDepartures([]);
-      setSearchResults([]);
-      setQuery('');
-    } else {
-      isMountedRef.current = true;
+    if (paramStationId && paramProvider) {
+       const prov = paramProvider.toUpperCase() as Provider;
+       if (!station || station.id !== paramStationId) {
+         const saved = localStorage.getItem('resmus_favorites');
+         const favs = saved ? JSON.parse(saved) : [];
+         const existing = favs.find((f: Station) => f.id === paramStationId);
+         
+         if (existing) {
+            setStation(existing);
+         } else {
+            setStation({ id: paramStationId, provider: prov, name: 'Laddar station...', coords: { lat: 0, lng: 0 } });
+         }
+         setProvider(prov);
+       }
+    } else if (!paramStationId && isMountedRef.current) {
+        setStation(null);
+        setDepartures([]);
+    }
+    isMountedRef.current = true;
+  }, [paramStationId, paramProvider]);
+
+  // Clear station/results when provider changes manually
+  useEffect(() => {
+    if (isMountedRef.current && !paramStationId) {
+        setStation(null);
+        setDepartures([]);
+        setSearchResults([]);
+        setQuery('');
     }
   }, [provider]);
 
@@ -536,9 +542,20 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
             if (nowTime < startTime || nowTime > endTime) return false;
 
             // Check Line Name match (e.g. "3955", "Blå Tåget", "17")
-            const affectedLine = sit.affectedLines?.some(l =>
-              l.designation === dep.line || dep.line.includes(l.designation)
-            );
+            const affectedLine = sit.affectedLines?.some(l => {
+              if (!l) return false;
+              
+              // 1. Strict match by unique GID if both are present
+              if (l.gid && dep.lineGid) {
+                 return l.gid === dep.lineGid;
+              }
+
+              // 2. Fallback to name matching (for other providers, or if GIDs are somehow missing)
+              if (!l.designation) return false;
+              const ds = l.designation.toLowerCase();
+              const dl = dep.line.toLowerCase();
+              return ds === dl || (ds.length > 3 && dl.includes(ds));
+            });
 
             // Check Stop match
             const affectedStop = sit.affectedStopPoints?.some(s => s.gid === station.id);
@@ -870,36 +887,27 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
   return (
     <div className="flex flex-col h-full bg-transparent relative overflow-hidden">
 
-      {/* --- Root Mode Switcher (Compact) --- */}
-      {/* --- Root Mode Switcher (Enhanced Design) --- */}
-      <div className="flex-none z-30 bg-white/60 dark:bg-slate-900/80 backdrop-blur-xl shadow-sm border-b border-slate-200/50 dark:border-slate-800/50 px-6 py-4">
-        <div className="flex bg-slate-100 dark:bg-slate-800/80 p-1.5 rounded-full max-w-sm mx-auto w-full shadow-inner ring-1 ring-black/5 dark:ring-white/5">
+      {/* --- Root Mode Switcher (Modernized) --- */}
+      <div className="flex-none z-30 bg-white/80 dark:bg-slate-900/90 backdrop-blur-md border-b border-slate-100 dark:border-slate-800/60 px-4 py-3">
+        <div className="flex bg-slate-100/80 dark:bg-slate-800 p-1 rounded-xl max-w-xs mx-auto w-full ring-1 ring-black/[0.03] dark:ring-white/[0.02]">
           <button
             onClick={() => setRootView('station')}
-            className={`relative flex-1 py-2.5 rounded-full transition-all duration-300 flex items-center justify-center gap-2 text-sm font-bold tracking-tight overflow-hidden group ${rootView === 'station'
-              ? 'bg-[#0095eb] text-white shadow-md shadow-sky-500/20 ring-1 ring-white/20 scale-[1.02]'
-              : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-white/50 dark:hover:bg-slate-700/50'
+            className={`relative flex-1 py-2 rounded-lg transition-all duration-300 flex items-center justify-center gap-2 text-sm font-bold tracking-tight ${rootView === 'station'
+              ? 'bg-[#0095eb] text-white shadow-md shadow-sky-500/20'
+              : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
               }`}
           >
-            <StationHIcon
-              className={`w-5 h-5 transition-transform duration-300 ${rootView === 'station' ? 'scale-110' : 'group-hover:scale-110 opacity-70'}`}
-            />
-            <span>Hållplats</span>
+            <span className="relative z-10">Hållplats</span>
           </button>
 
           <button
             onClick={() => setRootView('planner')}
-            className={`relative flex-1 py-2.5 rounded-full transition-all duration-300 flex items-center justify-center gap-2 text-sm font-bold tracking-tight overflow-hidden group ${rootView === 'planner'
-              ? 'bg-[#0095eb] text-white shadow-md shadow-sky-500/20 ring-1 ring-white/20 scale-[1.02]'
-              : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-white/50 dark:hover:bg-slate-700/50'
+            className={`relative flex-1 py-2 rounded-lg transition-all duration-300 flex items-center justify-center gap-2 text-sm font-bold tracking-tight ${rootView === 'planner'
+              ? 'bg-[#0095eb] text-white shadow-md shadow-sky-500/20'
+              : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
               }`}
           >
-            <Navigation
-              className={`w-4 h-4 transition-transform duration-300 ${rootView === 'planner' ? 'scale-110' : 'group-hover:scale-110 opacity-70'}`}
-              strokeWidth={2.5}
-              fill={rootView === 'planner' ? "currentColor" : "none"}
-            />
-            <span>Sök Resa</span>
+            <span className="relative z-10">Sök Resa</span>
           </button>
         </div>
       </div>
@@ -925,7 +933,10 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                   <input
                     type="text"
                     className="block w-full pl-10 pr-12 py-3 bg-transparent border-none text-slate-800 dark:text-slate-100 placeholder-slate-400 rounded-2xl font-black text-base outline-none"
-                    placeholder="Sök hållplats..."
+                    placeholder={
+                      provider === Provider.RESROBOT ? "Sök hållplats (t.ex. Örebro, Kumla, Nora)..." :
+                        provider === Provider.TRAFIKVERKET ? "Sök tågstation (t.ex. Stockholm C, Göteborg C)..." : "Sök hållplats..."
+                    }
                     value={query}
                     onChange={e => setQuery(e.target.value)}
                     onFocus={() => setShowSuggestions(true)}
@@ -939,8 +950,8 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                         onClick={() => {
                           let next: Provider;
                           if (provider === Provider.VASTTRAFIK) next = Provider.SL;
-                          else if (provider === Provider.SL) next = Provider.TRAFIKVERKET;
-                          else if (provider === Provider.TRAFIKVERKET) next = Provider.RESROBOT;
+                          else if (provider === Provider.SL) next = Provider.RESROBOT;
+                          else if (provider === Provider.RESROBOT) next = Provider.TRAFIKVERKET;
                           else next = Provider.VASTTRAFIK;
 
                           setProvider(next);
@@ -953,8 +964,8 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                         title={
                           provider === Provider.VASTTRAFIK ? "Källa: Västtrafik (Klicka för att byta)" :
                             provider === Provider.SL ? "Källa: SL (Stockholm)" :
-                              provider === Provider.TRAFIKVERKET ? "Källa: Trafikverket (Tåg)" :
-                                "Källa: Resrobot (Hela Sverige)"
+                              provider === Provider.RESROBOT ? "Källa: ResRobot – Hela Sverige inkl. Örebro län" :
+                                "Källa: Trafikverket – Tåg (som trafikleverantör)"
                         }
                       >
                         {/* Brand Badges */}
@@ -970,15 +981,15 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                           </div>
                         )}
 
-                        {provider === Provider.TRAFIKVERKET && (
-                          <div className="w-7 h-7 rounded-full bg-[#d2232a] flex items-center justify-center shadow-sm border border-white/20">
-                            <span className="font-black text-white text-[10px] tracking-tighter leading-none mt-[1px]">TrV</span>
-                          </div>
-                        )}
-
                         {provider === Provider.RESROBOT && (
                           <div className="w-7 h-7 rounded-full bg-[#1f2937] flex items-center justify-center shadow-sm border border-white/20">
                             <span className="font-black text-[#8cc63f] text-[10px] tracking-tighter leading-none mt-[1px]">RR</span>
+                          </div>
+                        )}
+
+                        {provider === Provider.TRAFIKVERKET && (
+                          <div className="w-7 h-7 rounded-full bg-[#d2232a] flex items-center justify-center shadow-sm border border-white/20">
+                            <span className="font-black text-white text-[10px] tracking-tighter leading-none mt-[1px]">TrV</span>
                           </div>
                         )}
 
@@ -998,8 +1009,8 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                       {/* No Results Message */}
                       {query && searchResults.length === 0 && !isSearching && (
                         <div className="px-4 py-3 text-slate-500 dark:text-slate-400 text-sm text-center italic">
-                          Inga hållplatser hittades via {provider === Provider.VASTTRAFIK ? 'Västtrafik' : provider === Provider.SL ? 'SL' : provider === Provider.TRAFIKVERKET ? 'Trafikverket' : 'Resrobot'}.
-                          <br /><span className="text-xs opacity-70">Prova att byta sökkälla med knappen till höger.</span>
+                          Inga hållplatser hittades via {provider === Provider.VASTTRAFIK ? 'Västtrafik' : provider === Provider.SL ? 'SL' : provider === Provider.TRAFIKVERKET ? 'Trafikverket' : 'ResRobot'}.
+                          <br /><span className="text-xs opacity-70">Prova att byta sökkälla, eller sök t.ex. &quot;Örebro&quot;, &quot;Kumla&quot; för Örebro län.</span>
                         </div>
                       )}
                       {/* Location Option - Show when query is empty */}
@@ -1019,13 +1030,16 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                       {searchResults.map((s, idx) => (
                         <button
                           key={`${s.id}-${idx}`}
-                          onClick={() => handleSelectStation(s)}
+                          onClick={() => {
+                            handleSelectStation(s);
+                            navigate(`/station/${s.provider.toLowerCase()}/${s.id}`);
+                          }}
                           className="w-full text-left px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex items-center gap-3.5 transition-colors group relative border-b border-slate-50 dark:border-slate-800/50 last:border-0"
                         >
                           <div className={`w-9 h-9 rounded-full flex items-center justify-center shadow-sm shrink-0 transition-all group-hover:scale-105 group-hover:shadow-md ${provider === Provider.SL ? 'bg-blue-100 text-[#0078bf] dark:bg-[#0078bf]/20 dark:text-[#0078bf]' :
                             provider === Provider.VASTTRAFIK ? 'bg-sky-100 text-[#0095eb] dark:bg-[#0095eb]/20 dark:text-[#0095eb]' :
                               provider === Provider.TRAFIKVERKET ? 'bg-red-100 text-[#d2232a] dark:bg-[#d2232a]/20 dark:text-[#d2232a]' :
-                                'bg-green-100 text-[#8cc63f] dark:bg-[#8cc63f]/20 dark:text-[#8cc63f]'
+                                  'bg-green-100 text-[#8cc63f] dark:bg-[#8cc63f]/20 dark:text-[#8cc63f]'
                             }`}>
                             <FontAwesomeIcon icon={faMapPin} className="text-sm" />
                           </div>
@@ -1058,9 +1072,14 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
 
                     {/* Left: Station & Weather */}
                     <div className="flex items-center gap-2 min-w-0 overflow-hidden">
-                      <h1 className="text-lg sm:text-xl font-black text-slate-800 dark:text-white truncate tracking-tight leading-none">
-                        {station.name}
-                      </h1>
+                      <div className="min-w-0">
+                        <h1 className="text-lg sm:text-xl font-black text-slate-800 dark:text-white truncate tracking-tight leading-none">
+                          {station.name}
+                        </h1>
+                        {provider === Provider.TRAFIKVERKET && (
+                          <p className="text-[10px] font-semibold text-slate-500 dark:text-slate-400 mt-0.5">Trafikverket som trafikleverantör</p>
+                        )}
+                      </div>
 
                       {station.coords && (
                         <div className="scale-75 origin-left flex-shrink-0 opacity-80">
@@ -1076,8 +1095,22 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                           <FontAwesomeIcon icon={faStar} className="text-xs" />
                         </button>
                         <button
-                          onClick={() => setStation(null)}
-                          className="p-1.5 text-slate-300 hover:text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors"
+                          onClick={() => {
+                            const url = `${window.location.origin}/#/station/${station.provider.toLowerCase()}/${station.id}`;
+                            navigator.clipboard.writeText(url);
+                            toast.success('Länk kopierad', 'Du kan nu dela denna hållplats!');
+                          }}
+                          className="p-1.5 text-slate-300 hover:text-sky-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors"
+                          title="Kopiera länk"
+                        >
+                          <FontAwesomeIcon icon={faShareAlt} className="text-xs" />
+                        </button>
+                        <button
+                          onClick={() => {
+                             setStation(null);
+                             navigate('/');
+                          }}
+                          className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors"
                         >
                           <FontAwesomeIcon icon={faTimes} className="text-xs" />
                         </button>
@@ -1112,11 +1145,6 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                           </button>
                           <input type="datetime-local" className="absolute inset-0 opacity-0 w-full h-full cursor-pointer" onChange={(e) => setCustomTime(e.target.value)} />
                         </div>
-
-                        {/* Clock/Min Toggle */}
-                        <button onClick={() => setTimeDisplayMode(timeDisplayMode === 'minutes' ? 'clock' : 'minutes')} className="w-7 h-7 flex items-center justify-center rounded-full text-slate-400 hover:text-sky-600 transition-colors" title="Växla tidsvisning">
-                          {timeDisplayMode === 'minutes' ? <span className="text-[9px] font-bold">MIN</span> : <FontAwesomeIcon icon={faClock} className="text-xs" />}
-                        </button>
 
                         {/* Zoom */}
                         <button onClick={() => setIsDense(!isDense)} className={`w-7 h-7 flex items-center justify-center rounded-full transition-all ${isDense ? 'text-sky-600 bg-sky-50 dark:bg-sky-900/20' : 'text-slate-400 hover:text-sky-600'}`} title="Kompakt läge">
@@ -1233,18 +1261,17 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
           {/* Controls Bar - Discrete & Clean */}
 
 
-          {/* Blue Header Bar (With Integrated Controls) */}
+          {/* Modern Column Header */}
           {
             station && (
-              <div className="bg-sky-400 text-white text-xs font-black uppercase tracking-wider py-1.5 px-4 relative flex items-center shadow-md z-10">
+              <div className="bg-sky-400 text-white text-[10px] sm:text-xs font-black uppercase tracking-widest py-1.5 px-4 relative flex items-center z-10 shadow-md">
 
-                {/* Grid Layout for Column Headers - Absolute to match content below */}
-                {/* Header Columns - Matching Row Layout */}
+                {/* Grid Layout for Column Headers */}
                 <div className="flex w-full items-center justify-between">
 
                   {/* Left: Line & Destination */}
                   <div className="flex items-center gap-3 flex-1 min-w-0">
-                    <div className="w-11 flex-shrink-0 flex justify-center items-center relative cursor-pointer hover:text-sky-200 transition-colors" onClick={toggleSort}>
+                    <div className="w-11 flex-shrink-0 flex justify-center items-center relative cursor-pointer hover:text-sky-100 transition-colors" onClick={toggleSort}>
                       <span>Linje</span>
                     </div>
                     <div className="flex-1 font-bold pl-1">Destination</div>
@@ -1254,7 +1281,9 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
                   <div className="flex items-center gap-2 pl-2 text-right">
                     <div className="min-w-[3.5rem]">Tid</div>
                     <div className="w-14 text-center">NY TID</div>
-                    <div className="w-8 md:w-9 text-center">Läge</div>
+                    <div className="w-10 text-right">
+                      LÄGE
+                    </div>
                   </div>
                 </div>
 
@@ -1266,8 +1295,6 @@ export const DeparturesBoard: React.FC<DeparturesBoardProps> = ({ initialStation
           <div className="flex-1 overflow-y-auto bg-white dark:bg-slate-950 pb-20">
             {!station ? (
               <div className="p-4">
-
-
                 {favorites.length > 0 && (
                   <div className="mb-2">
                     <h3 className="text-xs font-black uppercase tracking-widest text-slate-400 mb-3 px-1">Dina Favoriter</h3>

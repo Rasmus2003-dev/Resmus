@@ -30,16 +30,18 @@ export const formatDisruption = (disruption: TrafficSituation) => {
         if (isToday) {
             return `Idag ${d.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}`;
         } else {
-            // e.g. "Mån 12 feb"
-            return d.toLocaleDateString('sv-SE', { weekday: 'short', day: 'numeric', month: 'short' });
+            // e.g. "Mån 12 feb 14:30"
+            return d.toLocaleDateString('sv-SE', { weekday: 'short', day: 'numeric', month: 'short' }) + ' ' + d.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
         }
     };
 
     return {
         title: disruption.title || status,
         description: disruption.description,
-        statusText: status, // The translated short status
+        statusText: status,
         startTime: formatDate(disruption.startTime),
-        endTime: disruption.endTime ? formatDate(disruption.endTime) : null
+        endTime: disruption.endTime ? formatDate(disruption.endTime) : null,
+        publishedTime: disruption.publishedTime ? formatDate(disruption.publishedTime) : null,
+        reasonCode: disruption.reasonCode ?? null
     };
 };

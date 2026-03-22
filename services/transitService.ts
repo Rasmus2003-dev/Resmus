@@ -5,6 +5,7 @@ import { TrafiklabRealtimeService } from './trafiklabRealtimeService';
 
 import { SLService } from './slService';
 import { TrafiklabService } from './trafiklabService';
+import { TrafikverketService } from './trafikverketService';
 
 // Cache for API responses
 const apiCache = new Map<string, { data: any; timestamp: number }>();
@@ -310,6 +311,8 @@ const fetchVasttrafikDepartures = async (gid: string, mode: 'departures' | 'arri
 
             let dir = serviceJourney?.direction || "Okänd";
             if (dir) dir = dir.replace("Påstigning fram", "").trim();
+            // Ta bort kommatecken i destination (t.ex. "Göteborg, Nils Ericsson" → "Göteborg Nils Ericsson")
+            if (dir) dir = dir.replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
 
             if (mode === 'arrivals') {
                 // Try to find the Origin (where it came from)
@@ -319,6 +322,7 @@ const fetchVasttrafikDepartures = async (gid: string, mode: 'departures' | 'arri
                 } else {
                     dir = "Ankommande";
                 }
+                if (dir) dir = dir.replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
             }
 
             const planned = entry.plannedTime;
@@ -388,6 +392,7 @@ const fetchVasttrafikDepartures = async (gid: string, mode: 'departures' | 'arri
                 disruptionMessage: situations.length > 0 ? (situations[0].title || situations[0].description) : undefined,
                 type: transportMode,
                 serviceJourneyGid: serviceJourney?.gid,
+                lineGid: lineDetails?.gid,
                 datetime: timestamp,
                 stopPoint: {
                     name: entry.stopPoint?.name || '',
@@ -628,7 +633,6 @@ export const TransitService = {
             return ResrobotService.searchStations(query);
         }
         if (provider === Provider.TRAFIKVERKET) {
-            const { TrafikverketService } = await import('./trafikverketService');
             return TrafikverketService.searchStations(query);
         }
         if (provider === Provider.SL) {
@@ -673,88 +677,11 @@ export const TransitService = {
 
     getDepartures: async (stationId: string, provider: Provider, mode: 'departures' | 'arrivals', dateTime?: string, duration: number = 480): Promise<Departure[]> => {
         if (provider === Provider.RESROBOT) {
-            const departures = await ResrobotService.getDepartures(stationId, duration);
-
-            // Enrich with Trafikverket data for Trains
-            // Strategy: 
-            // 1. Identify if we have any trains in the result.
-            // 2. If so, fetch Trafikverket data for this station (by name).
-            // 3. Match entries by Approx Time + Line Number (AdvertisedTrainIdent).
-
-            const hasTrains = departures.some(d => d.type === 'TRAIN');
-            if (hasTrains) {
-                // We need the station name from somewhere. 
-                // We don't have it passed here, only ID. 
-                // BUT, if we have departures, we have d.stopPoint.name!
-                const stationName = departures[0]?.stopPoint?.name;
-                if (stationName) {
-                    try {
-                        const { TrafikverketService } = await import('./trafikverketService');
-                        const tvDepartures = await TrafikverketService.getTrainDepartures(stationName, dateTime);
-
-                        // Merge Logic
-                        return departures.map(d => {
-                            if (d.type !== 'TRAIN') return d;
-
-                            // Match: Line number must match. 
-                            // Time must be close matches (ResRobot might vary slightly or be same).
-                            // Best match keys: Line
-
-                            const match = tvDepartures.find(tv => {
-                                if (tv.line !== d.line) return false;
-
-                                // Check time diff < 15 mins
-                                const dTime = new Date(d.timestamp).getTime();
-                                const tvTime = new Date(tv.timestamp).getTime();
-                                return Math.abs(dTime - tvTime) < 15 * 60000;
-                            });
-
-                            if (match) {
-                                return {
-                                    ...d,
-                                    realtime: match.realtime || d.realtime, // Prefer TV realtime
-                                    track: match.track || d.track, // Prefer TV track (Läge)
-                                    status: match.status === 'CANCELLED' ? 'CANCELLED' : d.status,
-                                    hasDisruption: d.hasDisruption || match.hasDisruption,
-                                    disruptionMessage: [d.disruptionMessage, match.disruptionMessage].filter(Boolean).join('. '),
-                                    provider: Provider.TRAFIKVERKET // Mark as enriched? Or keep ResRobot? Keep ResRobot ID but updated data.
-                                };
-                            }
-                            return d;
-                        });
-                    } catch (e) {
-                        console.error("Failed to enrich with Trafikverket", e);
-                    }
-                }
-            }
-
-            return departures;
+            return ResrobotService.getDepartures(stationId, duration);
         }
         if (provider === Provider.TRAFIKVERKET) {
-            const { TrafikverketService } = await import('./trafikverketService');
-            // Check if stationId is a signature (tv-XYZ) or name. 
-            // If it starts with 'tv-', strip it. If plain, use it. 
-            // BUT getTrainDepartures expects NAME right now. 
-            // We should update getTrainDepartures to take signature if possible or handle mixed input.
-            // Since searchStations returns 'tv-SIGNATURE', we need to lookup name or fetch by signature.
-            // Let's modify TrafikverketService.getTrainDepartures to accept signature or handle it.
-            // For now, if ID starts with 'tv-', extract signature and use it.
-            let id = stationId;
-            if (id.startsWith('tv-')) id = id.replace('tv-', '');
-
-            // Wait, getTrainDepartures currently takes NAME and searches for signature.
-            // Refactoring getTrainDepartures to take Signature directly would be better.
-            // ... I'll rely on it taking name for now, but usually Station objects pass Name too?
-            // TransitService.getDepartures signature is (stationId...).
-            // We don't have name here if it's just ID passed from URL or cache.
-            // Ideally we pass Station object, but the interface is getDepartures(id...).
-
-            // Quick hack: Use "searchStations" approach inside getDepartures if needed or assume we can pass Name as ID?
-            // Actually, if the user selects from Search results (from TrafikverketService.searchStations), 
-            // `stationId` will be `tv-CST` (LocationSignature). 
-            // We should update `getTrainDepartures` to support fetching by Signature directly to be efficient.
-
-            return TrafikverketService.getTrainDepartures(id, dateTime);
+            const sign = stationId.replace(/^tv-/i, '');
+            return TrafikverketService.getTrainDepartures(sign, dateTime, mode);
         }
         if (provider === Provider.SL) {
             // SL Departure Fetch
@@ -818,7 +745,7 @@ export const TransitService = {
                     return {
                         type,
                         name,
-                        direction: leg.serviceJourney?.direction || (isWalk ? `Mot ${destName}` : ""),
+                        direction: (leg.serviceJourney?.direction || (isWalk ? `Mot ${destName}` : "")).replace(/,/g, ' ').replace(/\s+/g, ' ').trim(),
                         origin: {
                             name: originName,
                             time: new Date(leg.origin.plannedTime).toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' }),
@@ -860,28 +787,11 @@ export const TransitService = {
         } catch (e) { return []; }
     },
     getTrafikverketDisruptions: async (): Promise<TrafficSituation[]> => {
-        const { TrafikverketService } = await import('./trafikverketService');
-        const raw = await TrafikverketService.getDisruptions();
-
-        return raw.map(r => ({
-            situationNumber: r.id,
-            creationTime: r.updatedTime,
-            startTime: r.startTime,
-            endTime: r.endTime,
-            severity: r.severity,
-            title: r.title, // "Reason Code"
-            description: r.description, // "Operative event"
-            affectedLines: [], // Can we map County to something? Or just generic
-            affectedStopPoints: []
-        }));
+        return TrafikverketService.getDisruptions();
     },
 
     getJourneyDetails: async (journeyRef: string): Promise<JourneyDetail[]> => {
-        // Trafikverket Handler
-        if (journeyRef.startsWith('tv-')) {
-            const { TrafikverketService } = await import('./trafikverketService');
-            return TrafikverketService.getJourneyDetails(journeyRef).then(res => res || []);
-        }
+        if (journeyRef.startsWith('tv-')) return TrafikverketService.getJourneyDetails(journeyRef);
 
         // ResRobot Handler
         if (journeyRef.startsWith('resrobot:') || journeyRef.includes('accessId') || journeyRef.includes('resrobot')) {

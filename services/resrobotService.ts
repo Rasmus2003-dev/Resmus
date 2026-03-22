@@ -1,4 +1,4 @@
-import { Departure, Provider, Station, Journey, TripLeg } from '../types';
+import { Departure, Provider, Station, Journey, TripLeg, JourneyDetail } from '../types';
 import { API_KEYS, API_URLS } from './config';
 
 const fetchWithCors = async (url: string, retries = 3) => {
@@ -113,14 +113,16 @@ export const ResrobotService = {
             const departures = Array.isArray(data.Departure) ? data.Departure : [data.Departure];
 
             return departures.map((item: any) => {
-                let transportType: 'bus' | 'train' | 'tram' | 'ferry' | 'taxi' = 'bus';
+                let transportType: 'BUS' | 'TRAIN' | 'TRAM' | 'FERRY' | 'METRO' | 'UNK' = 'BUS';
                 // Product can be object or array
                 const product = Array.isArray(item.Product) ? item.Product[0] : item.Product;
+                const catCode = product?.catCode;
 
-                if (product?.catCode === '1') transportType = 'train';
-                else if (product?.catCode === '4') transportType = 'tram';
-                else if (product?.catCode === '5') transportType = 'bus';
-                else if (product?.catCode === '8' || product?.catCode === '3') transportType = 'bus'; // Express bus?
+                if (catCode === '1' || catCode === '2') transportType = 'TRAIN';
+                else if (catCode === '4') transportType = 'TRAM';
+                else if (catCode === '6') transportType = 'FERRY';
+                else if (catCode === '9') transportType = 'METRO';
+                else transportType = 'BUS';
 
                 // Clean Destination: Remove city name if it matches station's city
                 let direction = item.direction.split('(')[0].trim();
@@ -129,6 +131,21 @@ export const ResrobotService = {
                 const city = stationName.split(' ')[0];
                 if (city && direction.startsWith(city + " ") && city.length > 2) {
                     direction = direction.substring(city.length + 1);
+                }
+
+                // Color Heuristics
+                let bgColor = '#475569';
+                let fgColor = '#ffffff';
+
+                if (transportType === 'TRAIN') { bgColor = '#f43f5e'; } // Rose
+                else if (transportType === 'TRAM') { bgColor = '#0284c7'; } // Sky
+                else if (transportType === 'METRO') { bgColor = '#db2777'; } // Pink
+                else if (transportType === 'FERRY') { bgColor = '#4f46e5'; } // Indigo
+                else if (transportType === 'BUS') {
+                    const line = product?.num || "";
+                    if (["1","2","3","4","5","6"].includes(line)) bgColor = '#16a34a'; // Local Express
+                    else if (line.length >= 3 && line.startsWith('3')) bgColor = '#ea580c'; // Regional
+                    else bgColor = '#0ea5e9';
                 }
 
                 // User requested to remove generic operator names in the board
@@ -152,14 +169,13 @@ export const ResrobotService = {
                     // Check rtTime and ensure it's formatted HH:MM
                     realtime: item.rtTime ? item.rtTime.substring(0, 5) : null,
                     rtDate: item.rtDate,
-                    bgColor: null,
-                    fgColor: null,
+                    bgColor: bgColor,
+                    fgColor: fgColor,
                     provider: Provider.RESROBOT,
                     type: transportType,
                     // Check both predicted track (rtTrack) and planned track (track)
                     track: item.rtTrack || item.track || '',
-                    status: 'ON_TIME',
-                    hasDisruption: false,
+                    status: item.rtTime && item.rtTime !== item.time ? 'LATE' : 'ON_TIME',
                     operator: operator,
                     journeyRef: journeyRef,
                     journeyDetailRefUrl: item.JourneyDetailRef?.ref
@@ -351,6 +367,65 @@ export const ResrobotService = {
 
         } catch (e) {
             console.error("ResRobot planTrip error", e);
+            return [];
+        }
+    },
+
+    /** Hämta alla stopp mellan origin och dest (mellanstopp) – används som fallback när t.ex. Trafikverket bara ger start/slut. */
+    getTripStops: async (originName: string, destName: string, dateTime: string): Promise<JourneyDetail[]> => {
+        if (!originName || !destName) return [];
+        try {
+            const [origins, dests] = await Promise.all([
+                ResrobotService.searchStations(originName),
+                ResrobotService.searchStations(destName)
+            ]);
+            const originId = origins[0]?.id;
+            const destId = dests[0]?.id;
+            if (!originId || !destId) return [];
+
+            let url = `${API_URLS.RESROBOT_API}/trip?originId=${encodeURIComponent(originId)}&destId=${encodeURIComponent(destId)}&format=json&accessId=${API_KEYS.RESROBOT_API_KEY}&passlist=1&showPassingPoints=true`;
+            if (dateTime) {
+                const iso = new Date(dateTime);
+                const date = iso.toISOString().slice(0, 10);
+                const time = iso.toTimeString().slice(0, 5);
+                url += `&date=${date}&time=${time}`;
+            }
+
+            const res = await fetchWithCors(url);
+            if (!res.ok) return [];
+            const data = await res.json();
+            const trips = data.Trip ? (Array.isArray(data.Trip) ? data.Trip : [data.Trip]) : [];
+            const firstTrip = trips[0];
+            if (!firstTrip?.LegList?.Leg) return [];
+
+            const legs = Array.isArray(firstTrip.LegList.Leg) ? firstTrip.LegList.Leg : [firstTrip.LegList.Leg];
+            const trainLeg = legs.find((leg: any) => leg.type !== 'WALK' && (leg.Product?.catCode === '1' || leg.Product?.catCode === '2' || !leg.type));
+            const leg = trainLeg || legs[0];
+            const fmt = (t: string | undefined) => t ? t.substring(0, 5) : undefined;
+
+            const out: JourneyDetail[] = [];
+            const add = (name: string, dep?: string, arr?: string, track?: string) => {
+                out.push({
+                    name,
+                    time: fmt(dep) || fmt(arr) || '',
+                    departureTime: fmt(dep),
+                    arrivalTime: fmt(arr),
+                    track
+                });
+            };
+
+            if (leg.Origin) add(leg.Origin.name, leg.Origin.time, leg.Origin.time, leg.Origin.track);
+            const stops = leg.Stops?.Stop ?? leg.PassingPoint ?? leg.stops;
+            const stopList = Array.isArray(stops) ? stops : (stops ? [stops] : []);
+            stopList.forEach((s: any) => {
+                const name = s.name ?? s.Name ?? s.location?.name;
+                if (name) add(name, s.depTime ?? s.departureTime, s.arrTime ?? s.arrivalTime, s.track ?? s.rtTrack);
+            });
+            if (leg.Destination && leg.Origin?.name !== leg.Destination?.name) add(leg.Destination.name, leg.Destination.time, leg.Destination.time, leg.Destination.track);
+
+            return out;
+        } catch (e) {
+            console.error('ResRobot getTripStops error', e);
             return [];
         }
     }

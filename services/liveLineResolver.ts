@@ -49,26 +49,34 @@ const SL_TRAM_COLORS: Record<string, string> = {
     '30': '#a8559a',     // Tvärbanan
 };
 
-// Mode-based fallback colors per operator
+// Linjefärger per län/trafikslag – enhetliga, igenkännliga färger
 const OPERATOR_MODE_COLORS: Record<string, Record<string, string>> = {
     sl: { METRO: '#d91f26', TRAIN: '#ec619f', TRAM: '#ffa500', BUS: '#00639a', FERRY: '#01abdb' },
-    skane: { BUS: '#ffd700', TRAIN: '#d4003c', TRAM: '#97c900' },
+    skane: { BUS: '#ffd700', TRAIN: '#d4003c', TRAM: '#97c900', FERRY: '#0077be' },
+    vasttrafik: { BUS: '#006ab5', TRAM: '#f26522', TRAIN: '#00a651', FERRY: '#6e6e6e' },
     ul: { BUS: '#e3000b', TRAIN: '#005fa5' },
     otraf: { BUS: '#003b6f', TRAIN: '#003b6f' },
     jlt: { BUS: '#009639', TRAIN: '#009639' },
-    halland: { BUS: '#00a3e0' },
-    varm: { BUS: '#e30613' },
-    orebro: { BUS: '#0072bc' },
+    krono: { BUS: '#0072bc', TRAIN: '#0072bc' },
+    klt: { BUS: '#e30613', TRAIN: '#e30613' },
+    gotland: { BUS: '#00a3e0', FERRY: '#003d7a' },
+    halland: { BUS: '#00a3e0', TRAIN: '#00a3e0' },
+    varm: { BUS: '#e30613', TRAIN: '#e30613' },
+    orebro: { BUS: '#0072bc', TRAIN: '#0072bc' },
+    vastmanland: { BUS: '#00a651', TRAIN: '#00a651' },
     dt: { BUS: '#e30613', TRAIN: '#e30613' },
-    xt: { BUS: '#ed1c24' },
+    xt: { BUS: '#ed1c24', TRAIN: '#ed1c24' },
+    dintur: { BUS: '#0072bc', TRAIN: '#0072bc' },
+    blekinge: { BUS: '#00a3e0' },
+    sormland: { BUS: '#00639a', TRAIN: '#00639a' },
 };
 
 const DEFAULT_MODE_COLORS: Record<string, string> = {
     BUS: '#0ea5e9',
     TRAM: '#14b8a6',
-    TRAIN: '#d946ef',
-    METRO: '#d91f26',
-    FERRY: '#6366f1',
+    TRAIN: '#8b5cf6',
+    METRO: '#dc2626',
+    FERRY: '#4f46e5',
 };
 
 // ── SL Transport API Cache ─────────────────────────────────────────────────────
@@ -193,6 +201,16 @@ export const LiveLineResolver = {
     },
 
     /**
+     * Feed a single resolved destination (e.g. from NeTEx or TripUpdates) so other
+     * vehicles on the same line can use it when they lack destination in the feed.
+     */
+    feedDestination: (operator: string, line: string, dest: string): void => {
+        if (operator && line && line !== '?' && dest) {
+            trackDestination(operator, line, dest);
+        }
+    },
+
+    /**
      * Resolve line info instantly (sync). Returns null if no data available.
      */
     resolve: (operator: string, lineCode: string, tripHeadsign?: string | null): LineInfo | null => {
@@ -247,16 +265,28 @@ export const LiveLineResolver = {
             };
         }
 
-        // ── Generic operator resolution ──
+        // ── JLT (Jönköping) – linjespecifika färger (fallback när NeTEx inte är laddad)
+        if (op === 'jlt') {
+            const code = lineCode || '?';
+            const n = parseInt(code, 10);
+            if (code === '1') return { line: code, color: '#E61C24', textColor: '#ffffff', mode: 'BUS' };
+            if (code === '2') return { line: code, color: '#FBB040', textColor: '#000000', mode: 'BUS' };
+            if (code === '3') return { line: code, color: '#00A651', textColor: '#ffffff', mode: 'BUS' };
+            if (code === '4') return { line: code, color: '#00AEEF', textColor: '#ffffff', mode: 'BUS' };
+            if (!isNaN(n) && n >= 11 && n <= 99) return { line: code, color: '#662D91', textColor: '#ffffff', mode: 'BUS' };
+            return { line: code, color: '#7C3AED', textColor: '#ffffff', mode: 'BUS' };
+        }
+
+        // ── Generic operator resolution – använd operatörens färg per trafikslag ──
         const code = lineCode || '?';
         const opColors = OPERATOR_MODE_COLORS[op];
-        const fallbackColor = opColors?.BUS || DEFAULT_MODE_COLORS.BUS;
-        const mode = (opColors?.BUS) ? 'BUS' : 'BUS'; // simplistic
+        const fallbackColor = opColors?.BUS ?? DEFAULT_MODE_COLORS.BUS;
+        const textColor = '#ffffff';
 
         return {
             line: code,
             color: fallbackColor,
-            textColor: '#ffffff',
+            textColor,
             mode: 'BUS',
         };
     },

@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faCog, faMoon, faSun, faDesktop, faMobileAlt, faInfoCircle, faPalette, faServer, faCodeBranch, faHistory, faCheck, faDownload, faClock } from '@fortawesome/free-solid-svg-icons';
+import { faCog, faMoon, faSun, faDesktop, faMobileAlt, faInfoCircle, faPalette, faServer, faCodeBranch, faHistory, faCheck, faDownload, faClock, faUserPlus, faSignInAlt, faSignOutAlt } from '@fortawesome/free-solid-svg-icons';
 import { Provider } from '../types';
 import { useTheme } from './ThemeContext';
+import { useAuth } from '../contexts/AuthContext';
 
 interface SettingsViewProps {
   deferredPrompt: any;
@@ -10,6 +11,27 @@ interface SettingsViewProps {
 
 export const SettingsView: React.FC<SettingsViewProps> = ({ deferredPrompt }) => {
   const { theme, setTheme } = useTheme();
+  const { user, signInWithEmail, signUpWithEmail, signOut } = useAuth();
+  const [accountEmail, setAccountEmail] = useState('');
+  const [accountPassword, setAccountPassword] = useState('');
+  const [accountMode, setAccountMode] = useState<'signin' | 'signup'>('signup');
+  const [accountError, setAccountError] = useState<string | null>(null);
+  const [accountSuccess, setAccountSuccess] = useState<string | null>(null);
+
+  const handleAccountSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAccountError(null);
+    setAccountSuccess(null);
+    const { error } = accountMode === 'signup'
+      ? await signUpWithEmail(accountEmail, accountPassword)
+      : await signInWithEmail(accountEmail, accountPassword);
+    if (error) {
+      setAccountError(error.message);
+      return;
+    }
+    if (accountMode === 'signup') setAccountSuccess('Kontrollera din e-post för att bekräfta kontot.');
+    else setAccountSuccess('Inloggad.');
+  };
 
   const handleInstall = async () => {
     if (deferredPrompt) {
@@ -104,14 +126,79 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ deferredPrompt }) =>
           </div>
         </div>
 
+        {/* Konto (Supabase) */}
+        <section className="animate-in slide-in-from-bottom-4 fade-in duration-500">
+          <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 ml-1">Konto</h2>
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 shadow-sm">
+            {user ? (
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <p className="font-bold text-slate-800 dark:text-white">Inloggad</p>
+                  <p className="text-sm text-slate-500 dark:text-slate-400 truncate">{user.email || user.id}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => signOut()}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold text-sm hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                >
+                  <FontAwesomeIcon icon={faSignOutAlt} /> Logga ut
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={handleAccountSubmit} className="space-y-4">
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  {accountMode === 'signin' ? 'Logga in med ditt konto.' : 'Skapa konto för att spara favoriter och använda kartan.'}
+                </p>
+                <div className="space-y-2">
+                  <input
+                    type="email"
+                    placeholder="E-post"
+                    value={accountEmail}
+                    onChange={e => { setAccountEmail(e.target.value); setAccountError(null); }}
+                    className="w-full px-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:ring-2 focus:ring-sky-500 focus:border-transparent text-sm"
+                    required
+                  />
+                  <input
+                    type="password"
+                    placeholder="Lösenord (minst 6 tecken)"
+                    value={accountPassword}
+                    onChange={e => { setAccountPassword(e.target.value); setAccountError(null); }}
+                    className="w-full px-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-600 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:ring-2 focus:ring-sky-500 focus:border-transparent text-sm"
+                    required
+                    minLength={6}
+                  />
+                </div>
+                {accountError && <p className="text-sm text-red-600 dark:text-red-400">{accountError}</p>}
+                {accountSuccess && <p className="text-sm text-green-600 dark:text-green-400">{accountSuccess}</p>}
+                <div className="flex gap-2">
+                  <button
+                    type="submit"
+                    className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-sky-500 text-white font-bold text-sm hover:bg-sky-600 transition-colors shadow-sm"
+                  >
+                    <FontAwesomeIcon icon={accountMode === 'signup' ? faUserPlus : faSignInAlt} className="text-xs" />
+                    {accountMode === 'signup' ? 'Skapa konto' : 'Logga in'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setAccountMode(m => m === 'signup' ? 'signin' : 'signup'); setAccountError(null); setAccountSuccess(null); }}
+                    className="px-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 font-semibold text-sm hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                  >
+                    {accountMode === 'signup' ? 'Logga in' : 'Skapa konto'}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </section>
+
         {/* Provider Section */}
         <section className="animate-in slide-in-from-bottom-4 fade-in duration-500">
           <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 ml-1">Välj Trafikleverantör</h2>
           <div className="grid grid-cols-2 lg:grid-cols-2 gap-4">
             <ProviderCard id={Provider.VASTTRAFIK} label="Västtrafik" sub="Västra Götaland" color="#0095eb" iconLabel="VT" />
             <ProviderCard id={Provider.SL} label="SL" sub="Stockholm" color="#0078bf" iconLabel="SL" />
-            <ProviderCard id={Provider.TRAFIKVERKET} label="Trafikverket" sub="Sverige (Tåg)" color="#d2232a" iconLabel="TrV" />
             <ProviderCard id={Provider.RESROBOT} label="Resrobot" sub="Hela Sverige" color="#8cc63f" iconLabel="RR" />
+            <ProviderCard id={Provider.TRAFIKVERKET} label="Trafikverket" sub="Tåg (som trafikleverantör)" color="#d2232a" iconLabel="TrV" />
           </div>
         </section>
 

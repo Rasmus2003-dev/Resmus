@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { RefreshCw, Check, AlertTriangle, TramFront, Ship, BusFront, Clock, Calendar, AlertCircle, BellOff, BellRing, TrainFront, Filter } from 'lucide-react';
+import { RefreshCw, Check, AlertTriangle, TramFront, Ship, BusFront, Clock, Calendar, AlertCircle, BellOff, BellRing, TrainFront } from 'lucide-react';
 import { TransitService } from '../services/transitService';
 import { Provider } from '../types';
 import { DisruptionSkeleton } from './Loaders';
 import { formatDisruption } from '../utils/disruptionHelpers';
+import { supabase } from '../services/supabaseClient';
 
 interface UnifiedDisruption {
     id: string;
@@ -14,6 +15,10 @@ interface UnifiedDisruption {
     startTime: string;
     endTime?: string;
     updatedTime?: string;
+    /** Tid då störningen publicerades (Trafikverket). */
+    publishedTime?: string;
+    /** Orsakskod t.ex. OMÄ03 (Trafikverket). */
+    reasonCode?: string;
     affected?: { designation: string; color?: string; textColor?: string }[];
     type: 'BUS' | 'TRAM' | 'TRAIN' | 'SHIP' | 'METRO';
 }
@@ -22,7 +27,11 @@ export const TrafficDisruptions: React.FC = () => {
     const [disruptions, setDisruptions] = useState<UnifiedDisruption[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+    // Notis via Supabase-backend – ej frontend Notification API
+    const [notificationsEnabled, setNotificationsEnabled] = useState(() =>
+        localStorage.getItem('resmus_disruption_notifications_enabled') === 'true'
+    );
+    const [activeTab, setActiveTab] = useState<'new' | 'history'>('new');
     const seenIdsRef = useRef<Set<string>>(new Set());
     const isFirstLoad = useRef(true);
 
@@ -73,28 +82,33 @@ export const TrafficDisruptions: React.FC = () => {
     }, [provider]);
 
     useEffect(() => {
-        // Load notification preference
-        const savedPref = localStorage.getItem('resmus_disruption_notifications_enabled');
-        if (savedPref === 'true') {
-            if (Notification.permission === 'granted') {
-                setNotificationsEnabled(true);
-            }
-        }
-
-        // Load seen IDs to prevent spam on reload
+        // Load seen IDs
         try {
             const savedIds = localStorage.getItem('resmus_seen_disruptions');
             if (savedIds) {
                 const parsed = JSON.parse(savedIds);
-                if (Array.isArray(parsed)) {
-                    parsed.forEach(id => seenIdsRef.current.add(id));
-                }
+                if (Array.isArray(parsed)) parsed.forEach((id: string) => seenIdsRef.current.add(id));
             }
-        } catch (e) { }
+        } catch (_) { }
 
         fetchSituations();
         const interval = setInterval(fetchSituations, 60000);
-        return () => clearInterval(interval);
+
+        // Supabase Realtime -- used ONLY for live UI refresh, NOT for browser notifications
+        // Push notifications are sent via Supabase backend (Edge Functions / pg_notify)
+        const channel = supabase
+            .channel('public:traffic_disruptions')
+            .on('postgres_changes',
+                { event: 'INSERT', schema: 'public', table: 'traffic_disruptions' },
+                (_payload) => { fetchSituations(); }
+            )
+            .subscribe();
+
+        return () => {
+            clearInterval(interval);
+            supabase.removeChannel(channel);
+        };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const fetchSituations = async () => {
@@ -104,26 +118,26 @@ export const TrafficDisruptions: React.FC = () => {
             const unified: UnifiedDisruption[] = [];
 
             if (provider === Provider.TRAFIKVERKET) {
-                // Fetch Trafikverket Disruptions
                 try {
                     const tvData = await TransitService.getTrafikverketDisruptions();
-
                     tvData.forEach(ts => {
                         unified.push({
                             id: ts.situationNumber,
                             provider: Provider.TRAFIKVERKET,
-                            title: ts.title, // Reason Code
-                            description: ts.description, // Operative Event
-                            severity: 'normal', // Default for now
+                            title: ts.title,
+                            description: ts.description,
+                            severity: ts.severity,
                             startTime: ts.startTime,
                             endTime: ts.endTime,
                             updatedTime: ts.creationTime,
-                            type: 'TRAIN', // TV is mostly train
-                            affected: [] // TV doesn't give structured line info usually
+                            publishedTime: (ts as any).publishedTime,
+                            reasonCode: (ts as any).reasonCode,
+                            type: 'TRAIN',
+                            affected: ts.affectedLines?.map(l => ({ designation: l.designation })) || ts.affected || []
                         });
                     });
                 } catch (e) {
-                    console.error("TV Fetch failed", e);
+                    console.error("Trafikverket störningar kunde inte hämtas", e);
                 }
             } else if (provider === Provider.SL) {
                 // Fetch SL Deviations
@@ -255,46 +269,23 @@ export const TrafficDisruptions: React.FC = () => {
 
 
 
-            // Sort by update time (newest first)
-            // Removed severity sorting per user request
-            // Sort by the latest relevant timestamp (Updated or Start) to show newest activity first
-            // Sort by start time (newest first)
-            // Sort by latest activity (Updated or Created time)
+            // Senaste överst: sortera på publiceringstid (publishedTime), sedan updated/start
             unified.sort((a, b) => {
                 const getT = (item: UnifiedDisruption) => {
-                    // Prioritize Updated/Created time for "News Feed" style sorting
-                    // This puts the most recently modified or posted alerts at the top
-                    const t1 = item.updatedTime ? new Date(item.updatedTime).getTime() : 0;
-                    const t2 = item.startTime ? new Date(item.startTime).getTime() : 0;
-                    return Math.max(t1, t2);
+                    const published = item.publishedTime ? new Date(item.publishedTime).getTime() : 0;
+                    const updated = item.updatedTime ? new Date(item.updatedTime).getTime() : 0;
+                    const start = item.startTime ? new Date(item.startTime).getTime() : 0;
+                    return Math.max(published, updated, start);
                 };
                 return getT(b) - getT(a);
             });
 
-            // Notification Logic
-            if (!isFirstLoad.current && notificationsEnabled) {
-                const newDisruptions = unified.filter(d => !seenIdsRef.current.has(d.id));
-                if (newDisruptions.length > 0) {
-                    // Trigger notification for the most recent new disruption
-                    const latest = newDisruptions[0];
-                    if (Notification.permission === 'granted') {
-                        try {
-                            new Notification(`Ny trafikstörning: ${latest.title}`, {
-                                body: latest.description,
-                                icon: "https://cdn-icons-png.flaticon.com/512/3448/3448339.png",
-                                tag: latest.id
-                            });
-                        } catch (e) {
-                            console.error("Notification failed:", e);
-                        }
-                    }
-                }
-            }
-
-            // Update Seen IDs
+            // Track seen IDs for new/history split
             unified.forEach(d => seenIdsRef.current.add(d.id));
-            localStorage.setItem('resmus_seen_disruptions', JSON.stringify(Array.from(seenIdsRef.current).slice(0, 100))); // Keep last 100
+            localStorage.setItem('resmus_seen_disruptions',
+                JSON.stringify(Array.from(seenIdsRef.current).slice(0, 200)));
             isFirstLoad.current = false;
+            // NOTE: Push notifications are handled exclusively by Supabase backend (Edge Function)
 
             setDisruptions(unified);
         } catch (e) {
@@ -357,114 +348,113 @@ export const TrafficDisruptions: React.FC = () => {
         return bgColor;
     };
 
-    const handleToggleNotifications = async () => {
-        if (!notificationsEnabled) {
-            const permission = await Notification.requestPermission();
-            if (permission === 'granted') {
-                setNotificationsEnabled(true);
-                localStorage.setItem('resmus_disruption_notifications_enabled', 'true');
-                new Notification("Notiser aktiverade", {
-                    body: "Du kommer nu få meddelanden om nya trafikstörningar.",
-                    icon: "https://cdn-icons-png.flaticon.com/512/3448/3448339.png"
-                });
-            }
-        } else {
-            setNotificationsEnabled(false);
-            localStorage.setItem('resmus_disruption_notifications_enabled', 'false');
-        }
+    // Notiser skickas via Supabase backend — denna toggle sparar preferens
+    const handleToggleNotifications = () => {
+        const next = !notificationsEnabled;
+        setNotificationsEnabled(next);
+        localStorage.setItem('resmus_disruption_notifications_enabled', String(next));
+        // Backend läser denna preferens och skickar push när aktiverat
     };
 
 
 
-    // Use all disruptions, don't filter out unknown severity
-    const [filter, setFilter] = useState<'ALL' | 'BUS' | 'TRAIN' | 'METRO' | 'TRAM' | 'SHIP'>('ALL');
-    const [showFilter, setShowFilter] = useState(false);
+    // ── Tab split: "Ny" = senaste 6h, "Historik" = äldre ──────────────────
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+    const sortFn = (a: UnifiedDisruption, b: UnifiedDisruption) => {
+        const getLatest = (d: UnifiedDisruption) => Math.max(
+            d.updatedTime ? new Date(d.updatedTime).getTime() : 0,
+            (d as any).publishedTime ? new Date((d as any).publishedTime).getTime() : 0,
+            d.startTime ? new Date(d.startTime).getTime() : 0
+        );
+        return getLatest(b) - getLatest(a);
+    };
 
-    const activeDisruptions = disruptions.filter(d => {
-        if (filter === 'ALL') {
-            const limit = Date.now() - 24 * 60 * 60 * 1000;
-            const t1 = d.updatedTime ? new Date(d.updatedTime).getTime() : 0;
-            const t2 = d.startTime ? new Date(d.startTime).getTime() : 0;
-            // Keep if either updated or started in the last 24 hours
-            return Math.max(t1, t2) >= limit;
-        }
-        return d.type === filter;
-    });
+    const isNew = (d: UnifiedDisruption) => {
+        const t = Math.max(
+            d.updatedTime ? new Date(d.updatedTime).getTime() : 0,
+            (d as any).publishedTime ? new Date((d as any).publishedTime).getTime() : 0,
+            d.startTime ? new Date(d.startTime).getTime() : 0
+        );
+        return Date.now() - t <= SIX_HOURS;
+    };
+
+    const newDisruptions = disruptions.filter(isNew).sort(sortFn);
+    const historyDisruptions = disruptions.filter(d => !isNew(d)).sort(sortFn);
+    const activeDisruptions = activeTab === 'new' ? newDisruptions : historyDisruptions;
 
 
 
     return (
         <div className="h-full bg-slate-50 dark:bg-slate-950 overflow-y-auto">
 
-            {/* Clean Header */}
-            <div className="bg-white dark:bg-slate-900 border-b border-slate-100 dark:border-slate-800 sticky top-0 z-10 transition-all duration-300">
-                <div className="px-4 sm:px-6 py-4">
-                    <div className="flex items-center justify-between mb-4">
+            {/* Header */}
+            <div className="bg-white dark:bg-slate-900 border-b border-slate-100 dark:border-slate-800 sticky top-0 z-10">
+                <div className="px-4 pt-4 pb-0">
+                    <div className="flex items-center justify-between mb-3">
                         <div>
-                            <h1 className="text-xl sm:text-2xl font-black text-slate-800 dark:text-white">
-                                Trafikstörningar
-                            </h1>
-                            <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-                                {activeDisruptions.length} aktiva störningar
+                            <h1 className="text-xl font-black text-slate-800 dark:text-white">Trafikstörningar</h1>
+                            <p className="text-xs text-slate-400 mt-0.5">
+                                {newDisruptions.length} nya · {historyDisruptions.length} i historik
                             </p>
                         </div>
                         <div className="flex gap-2">
-                            <button
-                                onClick={() => setShowFilter(!showFilter)}
-                                className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all active:scale-95 ${showFilter || filter !== 'ALL'
-                                    ? 'bg-slate-800 text-white dark:bg-white dark:text-slate-900 shadow-md ring-2 ring-slate-200 dark:ring-slate-700'
-                                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
-                                    }`}
-                            >
-                                <Filter size={18} />
-                            </button>
-
+                            {/* Bell = backend notis-prenumeration */}
                             <button
                                 onClick={handleToggleNotifications}
-                                className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all relative ${notificationsEnabled ? 'bg-sky-500 text-white shadow-lg shadow-sky-500/30' : 'bg-slate-100 dark:bg-slate-800 text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'}`}
-                                title={notificationsEnabled ? "Notiser på" : "Aktivera notiser"}
+                                className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all relative ${
+                                    notificationsEnabled
+                                        ? 'bg-sky-500 text-white shadow-md shadow-sky-500/30'
+                                        : 'bg-slate-100 dark:bg-slate-800 text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+                                }`}
+                                title={notificationsEnabled ? 'Notiser aktiverade (via backend)' : 'Aktivera notiser'}
                             >
                                 {notificationsEnabled && (
-                                    <span className="absolute -top-1 -right-1 flex h-3 w-3">
-                                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75"></span>
-                                        <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500 border-2 border-white dark:border-slate-900"></span>
-                                    </span>
+                                    <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full border-2 border-white dark:border-slate-900" />
                                 )}
-                                {notificationsEnabled ? <BellRing size={18} className="animate-wiggle" /> : <BellOff size={18} />}
+                                {notificationsEnabled ? <BellRing size={16} /> : <BellOff size={16} />}
                             </button>
                             <button
                                 onClick={fetchSituations}
-                                className="w-10 h-10 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 rounded-xl flex items-center justify-center hover:bg-slate-200 dark:hover:bg-slate-700 transition-all active:scale-95"
                                 disabled={loading}
+                                className="w-9 h-9 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 rounded-xl flex items-center justify-center hover:bg-slate-200 dark:hover:bg-slate-700 transition-all active:scale-95"
                             >
-                                <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+                                <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                             </button>
                         </div>
                     </div>
-                    {/* Filter Bar */}
-                    <div className={`grid transition-all duration-300 ease-out overflow-hidden ${showFilter ? 'grid-rows-[1fr] opacity-100 mt-2' : 'grid-rows-[0fr] opacity-0 mt-0'}`}>
-                        <div className="min-h-0 overflow-x-auto pb-1 no-scrollbar flex gap-2">
-                            {[
-                                { id: 'ALL', label: 'Alla', icon: null },
-                                { id: 'BUS', label: 'Buss', icon: BusFront },
-                                { id: 'METRO', label: 'Tunnelbana', icon: TrainFront },
-                                { id: 'TRAIN', label: 'Tåg', icon: TrainFront },
-                                { id: 'TRAM', label: 'Spårvagn', icon: TramFront },
-                                { id: 'SHIP', label: 'Båt', icon: Ship },
-                            ].map(opt => (
-                                <button
-                                    key={opt.id}
-                                    onClick={() => setFilter(opt.id as any)}
-                                    className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-2 transition-all whitespace-nowrap ${filter === opt.id
-                                        ? 'bg-slate-800 text-white dark:bg-white dark:text-slate-900 shadow-md transform scale-105'
-                                        : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
-                                        }`}
-                                >
-                                    {opt.icon && <opt.icon size={14} />}
-                                    {opt.label}
-                                </button>
-                            ))}
-                        </div>
+
+                    {/* Tabs */}
+                    <div className="flex gap-1 border-b-0">
+                        <button
+                            onClick={() => setActiveTab('new')}
+                            className={`px-4 py-2 text-sm font-bold rounded-t-xl transition-all border-b-2 ${
+                                activeTab === 'new'
+                                    ? 'text-sky-600 dark:text-sky-400 border-sky-500 bg-sky-50/50 dark:bg-sky-900/10'
+                                    : 'text-slate-400 border-transparent hover:text-slate-600 dark:hover:text-slate-300'
+                            }`}
+                        >
+                            Nytt
+                            {newDisruptions.length > 0 && (
+                                <span className="ml-1.5 bg-sky-500 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full">
+                                    {newDisruptions.length}
+                                </span>
+                            )}
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('history')}
+                            className={`px-4 py-2 text-sm font-bold rounded-t-xl transition-all border-b-2 ${
+                                activeTab === 'history'
+                                    ? 'text-slate-700 dark:text-slate-200 border-slate-400 bg-slate-50 dark:bg-slate-800/50'
+                                    : 'text-slate-400 border-transparent hover:text-slate-600 dark:hover:text-slate-300'
+                            }`}
+                        >
+                            Historik
+                            {historyDisruptions.length > 0 && (
+                                <span className="ml-1.5 bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-[10px] font-black px-1.5 py-0.5 rounded-full">
+                                    {historyDisruptions.length}
+                                </span>
+                            )}
+                        </button>
                     </div>
                 </div>
             </div>
@@ -494,32 +484,25 @@ export const TrafficDisruptions: React.FC = () => {
                 )}
 
                 {/* Empty State */}
-                {/* Empty State */}
                 {!loading && activeDisruptions.length === 0 && (
                     <div className="flex flex-col items-center justify-center py-16 animate-in fade-in zoom-in-95 duration-500">
-                        <div className="w-20 h-20 bg-emerald-100 dark:bg-emerald-900/20 rounded-full flex items-center justify-center mb-4 shadow-sm">
-                            <Check size={40} className="text-emerald-600 dark:text-emerald-400" />
+                        <div className="w-16 h-16 bg-emerald-100 dark:bg-emerald-900/20 rounded-full flex items-center justify-center mb-4">
+                            <Check size={32} className="text-emerald-600 dark:text-emerald-400" />
                         </div>
-                        <h3 className="font-black text-xl text-slate-800 dark:text-white mb-2">
-                            Inga störningar
-                        </h3>
-                        <p className="text-sm text-slate-500 dark:text-slate-400 text-center max-w-xs mb-6 leading-relaxed">
-                            Just nu finns det inga rapporterade trafikstörningar för ditt valda filter.
+                        <p className="font-bold text-slate-700 dark:text-slate-300 mb-1">
+                            {activeTab === 'new' ? 'Inga nya störningar' : 'Ingen historik'}
                         </p>
-
-                        <button
-                            onClick={fetchSituations}
-                            className="flex items-center gap-2 px-5 py-2.5 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-full font-bold text-sm hover:bg-slate-200 dark:hover:bg-slate-700 transition-all active:scale-95 shadow-sm hover:shadow"
-                        >
-                            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
-                            <span>Uppdatera nu</span>
-                        </button>
+                        <p className="text-sm text-slate-400 text-center max-w-xs">
+                            {activeTab === 'new'
+                                ? 'Inga störningar rapporterade de senaste 6 timmarna.'
+                                : 'Inga äldre störningar att visa.'}
+                        </p>
                     </div>
                 )}
 
                 {/* Disruption Cards */}
                 {activeDisruptions.map((item, index) => {
-                    const isLatest = index === 0 && filter === 'ALL';
+                    const isLatest = index === 0;
                     const styles = getSeverityStyles(item.severity);
                     const Icon = getTransportIcon(item.type);
 
@@ -544,19 +527,7 @@ export const TrafficDisruptions: React.FC = () => {
 
                                     {/* Header Content */}
                                     <div className="flex-1 min-w-0 pt-0.5">
-                                        {isLatest && (
-                                            <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-[10px] font-bold uppercase tracking-wide mb-2 border border-blue-200 dark:border-blue-800">
-                                                <Clock size={10} />
-                                                Senaste nytt
-                                            </div>
-                                        )}
                                         <div className="mb-2">
-                                            {/* Helper Status Pre-header */}
-                                            {formatted?.statusText && formatted.statusText !== 'Trafikinfo' && (
-                                                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">
-                                                    {formatted.statusText}
-                                                </div>
-                                            )}
                                             <h3 className="font-bold text-slate-800 dark:text-white text-base leading-tight hover-copy cursor-pointer" onClick={() => navigator.clipboard.writeText(item.title)}>
                                                 {formatted?.title || item.title}
                                             </h3>
@@ -672,12 +643,29 @@ export const TrafficDisruptions: React.FC = () => {
                                                 </span>
                                             </div>
 
+                                            {item.updatedTime && (
+                                                <div className="flex justify-between sm:justify-start sm:gap-4">
+                                                    <span className="text-slate-500 dark:text-slate-400">Uppdaterad</span>
+                                                    <span className="font-medium text-slate-800 dark:text-slate-200">
+                                                        {getRelativeTime(item.updatedTime)}
+                                                    </span>
+                                                </div>
+                                            )}
+
                                             <div className="flex justify-between sm:justify-start sm:gap-4">
                                                 <span className="text-slate-500 dark:text-slate-400">Beräknas pågå till</span>
                                                 <span className="font-medium text-slate-800 dark:text-slate-200">
                                                     {formatted?.endTime || "Tillsvidare"}
                                                 </span>
                                             </div>
+                                            {(formatted as any)?.reasonCode && (
+                                                <div className="flex justify-between sm:justify-start sm:gap-4 sm:col-span-2">
+                                                    <span className="text-slate-500 dark:text-slate-400">ReasonCode</span>
+                                                    <span className="font-medium text-slate-800 dark:text-slate-200">
+                                                        {(formatted as any).reasonCode}
+                                                    </span>
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                 </div>

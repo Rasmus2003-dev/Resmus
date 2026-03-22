@@ -1,29 +1,64 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { MapContainer, TileLayer, Marker, Popup, useMap, Polyline, CircleMarker } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Tooltip, useMap, Polyline, CircleMarker } from 'react-leaflet';
 import { AnimatedMarker } from './AnimatedMarker';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { TrafiklabService } from '../services/trafiklabService';
 import { GtfsShapeService, VehicleRoutePayload } from '../services/gtfsShapeService';
+import { GtfsSwedenStaticService } from '../services/gtfsSwedenStaticService';
+import { GtfsDestinationService, type GtfsIndexes } from '../services/gtfsDestinationService';
 import { LiveLineResolver } from '../services/liveLineResolver';
-import { resolveStopName } from '../services/stopNameResolver';
-import { TRAFIKLAB_OPERATORS } from '../services/config';
+import { resolveStopName, getCachedStopName, prefetchStopNames } from '../services/stopNameResolver';
+import { TRAFIKLAB_OPERATORS, OPERATOR_REGIONS } from '../services/config';
 import jltVehicles from '../src/jlt-vehicles.json';
 import slVehicles from '../src/sl-vehicles.json';
 import skaneVehicles from '../src/skane-vehicles.json';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faBus, faTrain, faTram, faChevronDown, faLocationArrow, faXmark, faLayerGroup, faExpand, faCompress, faShip, faMoon, faSun, faSpinner, faSearch } from '@fortawesome/free-solid-svg-icons';
 
-const REFRESH_INTERVAL = 2000; // 2 seconds – real-time vehicle positions
+const REFRESH_INTERVAL = 2500; // 2.5s – som BKT busmap
+const VEHICLE_CACHE_TTL_MS = 5000; // 5s – återanvänd fordonsdata vid pan/zoom (BKT-stil)
 
 // ── Icon cache: keyed by "MODE|color|bearingBucket|line"
 // ── Modern 2026 Icon System ──────────────────────────────────────────────────
 // Vector-based, crisp, glass-morphic markers with distinct shapes per mode.
 
 const iconCache = new Map<string, L.DivIcon>();
-const buildIconHTML = (line: string, rotation: number, mode: string, color: string, operator?: string): string => {
+const truncateDest = (s: string, maxLen: number): string => {
+    const t = s.replace(/^Mot\s+/i, '').trim();
+    if (!t) return '';
+    return t.length <= maxLen ? t : t.slice(0, maxLen - 1) + '…';
+};
+/** True om strängen ser ut som ett riktigt linjenummer (inte route_id eller intern kod). */
+const looksLikeLineNumber = (s: string | null | undefined): boolean => {
+    const v = String(s || '').trim();
+    if (!v || v === '?') return false;
+    if (/^\d{1,4}$/.test(v)) return true;
+    if (/^\d{1,4}[A-Z]$/i.test(v)) return true;
+    if (/^[A-Z]{1,3}\d{1,4}[A-Z]?$/i.test(v)) return true;
+    if (/^[A-ZÅÄÖ]{1,6}$/i.test(v)) return true;
+    return false;
+};
+/** Visa linjenummer utan ledande noll. Örebro stadsbuss: 1–9 som en siffra ("3" inte "03"). "03" → "3", "30" → "30", "103" → "103". */
+const normalizeLineDisplay = (s: string | null | undefined): string => {
+    const v = String(s ?? '').trim();
+    if (!v || v === '?' || v === '-') return v;
+    if (/^\d+$/.test(v)) return v.replace(/^0+/, '') || '0';
+    if (/^\d+[A-Z]$/i.test(v)) return v.replace(/^\d+/, (m) => m.replace(/^0+/, '') || '0');
+    return v;
+};
+/** Formatera försening för badge (BKT-stil): +1, -2, +5 min. */
+const formatDelayBadge = (delaySeconds: number | null | undefined): string => {
+    if (delaySeconds == null || delaySeconds === 0) return '';
+    if (delaySeconds >= 60) return '+' + Math.round(delaySeconds / 60);
+    if (delaySeconds > 0) return '+1';
+    if (delaySeconds <= -60) return '-' + Math.round(Math.abs(delaySeconds) / 60);
+    return '-1';
+};
+const buildIconHTML = (line: string, rotation: number, mode: string, color: string, operator?: string, destination?: string, delaySeconds?: number | null): string => {
     const bgColor = color || '#0ea5e9';
+    const delayDisp = formatDelayBadge(delaySeconds);
     let vehicleShape = '';
     const op = (operator || '').toLowerCase();
 
@@ -34,48 +69,28 @@ const buildIconHTML = (line: string, rotation: number, mode: string, color: stri
             `<path d="M 16 30 L 32 30 L 30 36 L 18 36 Z" fill="#1e293b" opacity="0.5"/>`,
         ].join('');
     } else if (mode === 'TRAIN') {
-        if (op === 'sl') {
-            // SL Pendeltåg – rektangulär med röd accent och tydliga hjälstavar
-            vehicleShape = [
-                `<rect x="12" y="3" width="24" height="42" rx="6" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
-                `<rect x="12" y="3" width="24" height="10" rx="4" fill="#ec619f" opacity="0.9"/>`,
-                `<circle cx="18" cy="41" r="4" fill="#1e293b" opacity="0.85"/>`,
-                `<circle cx="30" cy="41" r="4" fill="#1e293b" opacity="0.85"/>`,
-                `<rect x="14" y="18" width="20" height="3" rx="1" fill="#ffffff" opacity="0.4"/>`,
-            ].join('');
-        } else {
-            vehicleShape = [
-                `<rect x="14" y="4" width="20" height="40" rx="4" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
-                `<path d="M 16 10 C 16 6 32 6 32 10 L 30 16 L 18 16 Z" fill="#1e293b" opacity="0.85"/>`,
-                `<circle cx="19" cy="40" r="3" fill="#1e293b" opacity="0.8"/>`,
-                `<circle cx="29" cy="40" r="3" fill="#1e293b" opacity="0.8"/>`,
-                `<rect x="16" y="22" width="16" height="3" rx="1" fill="#ffffff" opacity="0.3"/>`,
-            ].join('');
-        }
+        vehicleShape = [
+            `<rect x="10" y="8" width="28" height="32" rx="4" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
+            `<rect x="10" y="8" width="28" height="8" rx="3" fill="#1e293b" opacity="0.9"/>`,
+            `<circle cx="16" cy="38" r="4" fill="#1e293b" opacity="0.85"/>`,
+            `<circle cx="32" cy="38" r="4" fill="#1e293b" opacity="0.85"/>`,
+            `<rect x="12" y="20" width="24" height="4" rx="1" fill="#ffffff" opacity="0.35"/>`,
+        ].join('');
     } else if (mode === 'METRO') {
-        if (op === 'sl') {
-            // SL Tunnelbana – sexhörning med T-emblem
-            vehicleShape = [
-                `<polygon points="24,2 38,11 38,37 24,46 10,37 10,11" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
-                `<text x="24" y="30" text-anchor="middle" font-size="18" font-weight="900" fill="#ffffff" font-family="system-ui">T</text>`,
-            ].join('');
-        } else {
-            vehicleShape = [
-                `<rect x="13" y="3" width="22" height="42" rx="4" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
-                `<path d="M 15 9 C 15 5 33 5 33 9 L 32 13 L 16 13 Z" fill="#1e293b" opacity="0.8"/>`,
-                `<path d="M 15 39 C 15 43 33 43 33 39 L 32 36 L 16 36 Z" fill="#1e293b" opacity="0.8"/>`,
-                `<rect x="15" y="22" width="18" height="3" rx="1" fill="#ffffff" opacity="0.25"/>`,
-            ].join('');
-        }
+        vehicleShape = [
+            `<polygon points="24,2 40,12 40,36 24,46 8,36 8,12" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
+            `<text x="24" y="28" text-anchor="middle" font-size="20" font-weight="900" fill="#ffffff" font-family="system-ui,sans-serif">T</text>`,
+        ].join('');
     } else if (mode === 'TRAM') {
         vehicleShape = [
-            `<rect x="13" y="3" width="22" height="42" rx="4" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
-            `<path d="M 15 9 C 15 5 33 5 33 9 L 32 13 L 16 13 Z" fill="#1e293b" opacity="0.8"/>`,
-            `<path d="M 15 39 C 15 43 33 43 33 39 L 32 36 L 16 36 Z" fill="#1e293b" opacity="0.8"/>`,
-            `<rect x="15" y="22" width="18" height="3" rx="1" fill="#ffffff" opacity="0.25"/>`,
+            `<rect x="8" y="12" width="32" height="28" rx="4" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
+            `<path d="M 22 4 L 26 4 L 26 12 L 22 12 Z" fill="#1e293b" opacity="0.9"/>`,
+            `<rect x="14" y="22" width="20" height="4" rx="1" fill="#ffffff" opacity="0.3"/>`,
+            `<circle cx="14" cy="42" r="3" fill="#1e293b" opacity="0.8"/>`,
+            `<circle cx="34" cy="42" r="3" fill="#1e293b" opacity="0.8"/>`,
         ].join('');
     } else {
-        // BUS – standard
+        // BUS – original stil som tidigare
         vehicleShape = [
             `<rect x="11" y="5" width="26" height="38" rx="5" fill="${bgColor}" stroke="#ffffff" stroke-width="1.5"/>`,
             `<path d="M 13 11 C 13 7 35 7 35 11 L 34 15 L 14 15 Z" fill="#1e293b" opacity="0.85"/>`,
@@ -85,25 +100,29 @@ const buildIconHTML = (line: string, rotation: number, mode: string, color: stri
         ].join('');
     }
 
+    // Badge som förut: vit, ren, lätt skugga. Försening som enkel rad under (tydlig men inte pill).
+    const delayHtml = delayDisp ? `<br/><span style="font-size:9px;font-weight:700;color:#475569;">${delayDisp}</span>` : '';
     return [
         `<div style="width:48px;height:48px;position:relative;display:flex;align-items:center;justify-content:center;filter:drop-shadow(0px 3px 6px rgba(0,0,0,0.35));transform:translate3d(0,0,0);">`,
         `<div style="position:absolute;inset:0;transform:rotate(${rotation}deg);will-change:transform;display:flex;align-items:center;justify-content:center;">`,
         `<svg viewBox="0 0 48 48" width="48" height="48" xmlns="http://www.w3.org/2000/svg">${vehicleShape}</svg>`,
         `</div>`,
-        `<div style="position:absolute;z-index:10;display:flex;align-items:center;justify-content:center;width:100%;height:100%;pointer-events:none;">`,
-        `<span style="font-size:11px;font-weight:900;color:#1e293b;background-color:rgba(255,255,255,0.95);padding:2px 5px;border-radius:5px;font-family:system-ui,sans-serif;letter-spacing:-0.5px;box-shadow:0 1px 3px rgba(0,0,0,0.3);border:1px solid rgba(0,0,0,0.1);line-height:1;white-space:nowrap;">${line}</span>`,
+        `<div style="position:absolute;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;height:100%;pointer-events:none;gap:0;">`,
+        `<span style="font-size:11px;font-weight:900;color:#1e293b;background-color:rgba(255,255,255,0.95);padding:2px 5px;border-radius:5px;font-family:system-ui,sans-serif;letter-spacing:-0.5px;box-shadow:0 1px 3px rgba(0,0,0,0.3);border:1px solid rgba(0,0,0,0.1);line-height:1.15;white-space:${destination ? 'normal' : 'nowrap'};text-align:center;display:inline-block;">${line}${delayHtml}${destination ? `<br/><span style="font-size:8px;font-weight:700;color:#475569;">${truncateDest(destination, 10)}</span>` : ''}</span>`,
         `</div>`,
         `</div>`,
     ].join('');
 };
 
 
-const getIcon = (line: string, bearing: number, mode: string, color: string, operator?: string): L.DivIcon => {
+const getIcon = (line: string, bearing: number, mode: string, color: string, operator?: string, destination?: string, delaySeconds?: number | null): L.DivIcon => {
     const bucket = Math.round(bearing / 5) * 5;
-    const key = `${mode}|${color}|${bucket}|${line}|${operator || ''}`;
+    const destKey = destination ? truncateDest(destination, 12) : '';
+    const delayKey = formatDelayBadge(delaySeconds);
+    const key = `${mode}|${color}|${bucket}|${line}|${operator || ''}|${destKey}|${delayKey}`;
     if (iconCache.has(key)) return iconCache.get(key)!;
     const icon = L.divIcon({
-        html: buildIconHTML(line, bucket, mode, color, operator),
+        html: buildIconHTML(line, bucket, mode, color, operator, destination, delaySeconds),
         className: '',
         iconSize: [48, 48],
         iconAnchor: [24, 24],
@@ -138,11 +157,11 @@ const createRouteStub = (lat: number, lng: number, bearing: number): [number, nu
 const buildSiblingRoute = (selected: any, allVehicles: any[]): [number, number][] => {
     if (!selected.routeId && !selected.line) return [];
 
-    // Find siblings: same routeId or same line+operator
+    // If routeId is missing, matching just by line number creates crazy spiderwebs across the city.
+    // We only match by actual GTFS routeId.
     const siblings = allVehicles.filter(v => {
         if (v.id === selected.id) return false;
         if (selected.routeId && v.routeId === selected.routeId) return true;
-        if (selected.line && selected.line !== '?' && v.line === selected.line && v.operator === selected.operator) return true;
         return false;
     });
 
@@ -179,7 +198,7 @@ const buildSiblingRoute = (selected: any, allVehicles: any[]): [number, number][
 };
 
 const SUPPORTED_STATIC_OPERATORS = new Set([
-    'sl', 'ul', 'skane', 'otraf', 'jlt', 'krono', 'klt', 'gotland',
+    'sl', 'ul', 'skane', 'vasttrafik', 'otraf', 'jlt', 'krono', 'klt', 'gotland',
     'varm', 'orebro', 'vastmanland', 'dt', 'xt', 'dintur', 'halland', 'blekinge',
     'sormland', 'jamtland', 'vasterbotten', 'norrbotten'
 ]);
@@ -237,12 +256,16 @@ const inferOperatorFromRtId = (id?: string | null): string | null => {
 
 const getOperatorCandidates = (v: any, selectedOperator: string): string[] => {
     const out = new Set<string>();
+    // 1. Vehicle's own operator field (most authoritative)
     const raw = String(v?.operator || '').toLowerCase();
     if (SUPPORTED_STATIC_OPERATORS.has(raw)) out.add(raw);
+    // 2. Inferred from trip/route/vehicle IDs
     const inferred = inferOperatorFromRtId(v?.tripId) || inferOperatorFromRtId(v?.routeId) || inferOperatorFromRtId(v?.id);
     if (inferred && SUPPORTED_STATIC_OPERATORS.has(inferred)) out.add(inferred);
-    if (selectedOperator && SUPPORTED_STATIC_OPERATORS.has(selectedOperator)) out.add(selectedOperator);
-    if (out.size === 0) out.add('sl');
+    // 3. Selected operator (if not sweden)
+    if (selectedOperator && selectedOperator !== 'sweden' && SUPPORTED_STATIC_OPERATORS.has(selectedOperator)) out.add(selectedOperator);
+    // 4. Fallback: use the raw operator even if not in SUPPORTED list (instead of hardcoding 'sl')
+    if (out.size === 0 && raw) out.add(raw);
     return Array.from(out);
 };
 
@@ -337,7 +360,7 @@ const extractActualDestination = (value?: string | null): string | null => {
 const isUselessDestination = (dest?: string | null, line?: string | null): boolean => {
     if (!dest) return true;
     const d = dest.trim().toLowerCase();
-    if (d === '?' || d === 'null' || d === 'undefined' || d === 'okänd destination' || d === 'omnibuslinjen' || d === 'region') return true;
+    if (d === '?' || d === 'null' || d === 'undefined' || d === 'okänd destination' || d === 'omnibuslinjen' || d === 'region' || d === 'ej linjesatt' || d === 'linjesatt') return true;
     // Trip IDs often look like long numbers or have many segments with colons
     if (d.length >= 7 && (/^\d+$/.test(d) || (d.match(/:/g) || []).length >= 2)) return true;
     if (line && d === line.trim().toLowerCase()) return true;
@@ -365,9 +388,13 @@ const formatCompactPanel = (
     lineColor?: string,
     delaySeconds?: number | null
 ): CompactPanel => {
-    const lineFinal = gtfsLoading ? (displayLine || v.line || '?') : (displayLine || v.line || '?');
+    const lineFinal = normalizeLineDisplay(gtfsLoading ? (displayLine || v.line || '?') : (displayLine || v.line || '?'));
 
     let dest = extractActualDestination(displayDest || v.dest || '') || '';
+    // Förbjudet att visa "—" eller "Ej angiven hållplats" – räkna som saknad destination
+    if (GtfsDestinationService.isForbiddenDestination(dest)) dest = '';
+    // API kan skicka "Ej linjesatt" / "Linjesatt" som placeholder – räkna som saknad destination så vi visar "Linje X" eller "Mot X"
+    if (dest && /Ej i trafik|Depå|Inställd|Ej linjesatt|Linjesatt|Tomkörning/i.test(dest)) dest = '';
 
     // Prevent showing duplicated line as destination (e.g. "Mot 28", "Mot Linje 28").
     const normalizeLineToken = (value: string | null | undefined): string => {
@@ -392,31 +419,33 @@ const formatCompactPanel = (
 
     let title = '';
 
-    // "EJ I TRAFIK" logic: Only if destination explicitly matches patterns, or no line AND no dest.
-    const isExplicitlyNotInService = dest && /Ej i trafik|Depå|Inställd|Ej linjesatt|Tomkörning/i.test(dest);
+    // "EJ I TRAFIK" endast när destinationstexten uttryckligen säger det – inte när vi bara saknar rad/dest (t.ex. efter att "Ej linjesatt" rensats).
+    const isExplicitlyNotInService = dest && /Ej i trafik|Depå|Inställd|Ej linjesatt|Linjesatt|Tomkörning/i.test(dest);
 
-    if (isExplicitlyNotInService || (lineFinal === '?' && (!dest || dest === '?'))) {
+    if (isExplicitlyNotInService) {
         title = 'EJ I TRAFIK';
     } else if (!dest || dest === '?') {
-        // Better fallback hierarchy when destination is missing:
-        // next stop -> line label -> unknown.
+        // Better fallback hierarchy när destination saknas:
+        // 1) Nästa hållplats, 2) Linje, 3) Generisk titel.
         if (nextStopName) {
             title = `Mot ${nextStopName}`;
         } else if (lineFinal && lineFinal !== '?') {
             title = `Linje ${lineFinal}`;
+        } else if (v.line && v.line !== '?') {
+            title = `Linje ${v.line}`;
         } else {
-            title = 'Okänd destination';
+            title = 'Fordonsinformation';
         }
     } else {
         title = `Mot ${dest}`;
     }
 
-    // Clean up next stop formatting
-    let next = 'Ej angiven hållplats';
+    // Next stop: visa bara läsbart namn. Förbjudet att visa "—" – använd "I tid" eller nästa hållplats.
+    let next: string;
     if (nextStopName) {
         next = `Nästa: ${nextStopName}`;
-    } else if (v.stopId) {
-        next = `Hållplats-ID: ${v.stopId}`;
+    } else {
+        next = 'I tid'; // Statusrad: grön prick + "I tid" när nästa hållplats saknas (aldrig "—")
     }
 
     const chips: Chip[] = [];
@@ -496,12 +525,13 @@ const formatCompactPanel = (
 };
 
 // ── Vehicle Info Popup – renders above vehicle icon on the map ──────────────
-const VehicleInfoPopup = ({ vehicle, panel, numColor, nextStopDisplay, nextPlatform, gtfsLoading, onClose, mapRef }: {
+const VehicleInfoPopup = ({ vehicle, panel, numColor, nextStopDisplay, nextPlatform, destinationText, gtfsLoading, onClose, mapRef }: {
     vehicle: any;
     panel: CompactPanel;
     numColor: string;
     nextStopDisplay: string | null;
     nextPlatform: string | null;
+    destinationText: string | null;
     gtfsLoading: boolean;
     onClose: () => void;
     mapRef: L.Map | null;
@@ -525,10 +555,9 @@ const VehicleInfoPopup = ({ vehicle, panel, numColor, nextStopDisplay, nextPlatf
 
     if (!pos) return null;
 
-    // Position the panel centered horizontally above the icon, with a 45px upward offset
-    const panelWidth = 300;
+    const panelWidth = 248;
     const left = pos.x - panelWidth / 2;
-    const top = pos.y - 45; // Position above the icon
+    const top = pos.y - 38;
 
     return (
         <div
@@ -538,62 +567,65 @@ const VehicleInfoPopup = ({ vehicle, panel, numColor, nextStopDisplay, nextPlatf
                 top: `${top}px`,
                 width: `${panelWidth}px`,
                 transform: 'translateY(-100%)',
-                transition: 'left 0.3s ease, top 0.3s ease',
+                transition: 'left 0.15s ease-out, top 0.15s ease-out',
             }}
         >
-            <div className="pointer-events-auto relative overflow-hidden rounded-2xl shadow-lg dark:shadow-[0_10px_30px_-8px_rgba(0,0,0,0.5)] border border-slate-200/60 dark:border-white/10 backdrop-blur-2xl bg-white/95 dark:bg-[#0f172a]/95 ring-1 ring-black/5 p-3">
-                <div className="flex flex-col relative z-10 w-full">
-                    <div className="flex items-center gap-2.5 w-full relative pr-7">
+            <div className="pointer-events-auto relative overflow-hidden rounded-xl shadow-md dark:shadow-[0_8px_24px_-6px_rgba(0,0,0,0.4)] border border-slate-200/50 dark:border-white/10 backdrop-blur-xl bg-white/95 dark:bg-[#0f172a]/95 ring-1 ring-black/5 p-2.5">
+                <div className="flex flex-col relative z-10 w-full gap-1.5">
+                    <div className="flex items-center gap-2 w-full relative pr-6">
                         <div
-                            className="h-[34px] min-w-[44px] px-2 rounded-lg flex items-center justify-center font-black text-lg leading-none shadow-sm shrink-0 border border-white/20"
+                            className="h-8 min-w-[40px] px-1.5 rounded-md flex items-center justify-center font-bold text-sm leading-none shadow-sm shrink-0 border border-white/20"
                             style={{ backgroundColor: panel.lineColor, color: numColor }}
                         >
                             {panel.lineNumber}
                         </div>
-                        <div className="font-extrabold text-slate-800 dark:text-white text-[15px] leading-tight flex-1 min-w-0 pr-3 break-words whitespace-normal">
+                        <div className="font-bold text-slate-800 dark:text-white text-[13px] leading-tight flex-1 min-w-0 pr-2 break-words whitespace-normal">
                             {panel.title}
                         </div>
                         <button
                             onClick={onClose}
-                            className="absolute top-1/2 -translate-y-1/2 -right-0.5 w-6 h-6 shrink-0 rounded-full text-slate-400 hover:text-slate-700 dark:hover:text-white flex items-center justify-center transition-all active:scale-90"
+                            className="absolute top-1/2 -translate-y-1/2 -right-0.5 w-5 h-5 shrink-0 rounded-full text-slate-400 hover:text-slate-700 dark:hover:text-white flex items-center justify-center transition-all active:scale-90"
                         >
-                            <FontAwesomeIcon icon={faXmark} className="text-sm" />
+                            <FontAwesomeIcon icon={faXmark} className="text-xs" />
                         </button>
                     </div>
-
-                    <div className="mt-2 flex flex-col gap-0.5">
-                        <div className="flex items-center gap-1.5 text-slate-600 dark:text-slate-300 text-[12px] font-semibold w-full pr-3">
-                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-                            <span className="truncate">{panel.subtitle}</span>
+                    {destinationText && (
+                        <div className="flex items-center gap-1 text-slate-600 dark:text-slate-300 text-[11px] font-medium w-full pr-2">
+                            <span className="text-slate-400 dark:text-slate-500 shrink-0">Destination</span>
+                            <span className="truncate">{destinationText.startsWith('Mot ') ? destinationText : `Mot ${destinationText}`}</span>
                         </div>
-                        {nextStopDisplay && (
-                            <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400 text-[11px] font-medium pl-3">
-                                <span>📍</span>
-                                <span className="truncate">
-                                    {nextStopDisplay}
-                                    {nextPlatform ? ` · Läge ${nextPlatform}` : ''}
-                                </span>
-                            </div>
-                        )}
+                    )}
+                    <div className="flex items-center gap-1.5 text-slate-600 dark:text-slate-300 text-[11px] font-medium w-full pr-2">
+                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" title="I tid" />
+                        <span className="truncate">{panel.subtitle}</span>
                     </div>
-
-                    <div className="w-full h-[1px] bg-slate-200 dark:bg-slate-800 my-2" />
-
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                    {nextStopDisplay && !nextStopDisplay.startsWith('Hållplats ') && (
+                        <div className="flex items-center gap-1 text-slate-500 dark:text-slate-400 text-[10px] pl-0.5">
+                            <span>📍</span>
+                            <span className="truncate">
+                                {nextStopDisplay}
+                                {nextPlatform ? ` · ${nextPlatform}` : ''}
+                            </span>
+                        </div>
+                    )}
+                    <div className="w-full h-px bg-slate-200 dark:bg-slate-700 my-1" />
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                         {gtfsLoading ? (
-                            <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 shrink-0">
-                                <FontAwesomeIcon icon={faSpinner} className="animate-spin text-sky-500 text-xs" />
-                                <span className="text-[10px] font-semibold text-slate-600 dark:text-slate-300">Hämtar</span>
+                            <div className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 shrink-0">
+                                <FontAwesomeIcon icon={faSpinner} className="animate-spin text-sky-500 text-[10px]" />
+                                <span className="text-[9px] font-semibold text-slate-600 dark:text-slate-300">Hämtar</span>
                             </div>
                         ) : (
                             panel.chips.map((chip, i) => (
                                 <div key={i} className="flex flex-col shrink-0">
-                                    <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">{chip.label}</span>
-                                    <div className="text-[12px] font-bold text-slate-800 dark:text-slate-200 tracking-tight flex items-center gap-1 mt-0.5">
-                                        {chip.label.toLowerCase() === 'operatör' && (
-                                            <span className="w-3 h-3 rounded-sm flex items-center justify-center grayscale opacity-80 text-[10px]">🏢</span>
+                                    <span className="text-[8px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wide">{chip.label}</span>
+                                    <div className="text-[11px] font-semibold text-slate-800 dark:text-slate-200 tracking-tight flex items-center gap-0.5 mt-0.5">
+                                        {chip.label.toLowerCase() === 'operatör' && <span className="text-[9px] opacity-80">🏢</span>}
+                                        {chip.label === 'TURSTATUS' && chip.value === '✅ I tid' ? (
+                                            <span className="text-emerald-600 dark:text-emerald-400">{chip.value}</span>
+                                        ) : (
+                                            chip.value
                                         )}
-                                        {chip.value}
                                     </div>
                                 </div>
                             ))
@@ -601,27 +633,28 @@ const VehicleInfoPopup = ({ vehicle, panel, numColor, nextStopDisplay, nextPlatf
                     </div>
                 </div>
             </div>
-            {/* Small arrow pointing down to the vehicle */}
-            <div className="flex justify-center -mt-[1px]">
-                <div className="w-3 h-3 bg-white/95 dark:bg-[#0f172a]/95 border-r border-b border-slate-200/60 dark:border-white/10 rotate-45 -translate-y-1.5" />
+            <div className="flex justify-center -mt-px">
+                <div className="w-2.5 h-2.5 bg-white/95 dark:bg-[#0f172a]/95 border-r border-b border-slate-200/50 dark:border-white/10 rotate-45 -translate-y-1" />
             </div>
         </div>
     );
 };
 
 // ── Memoized Vehicle Marker
-const VehicleMarker = React.memo(({ v, onSelect, simpleMode, showLabels, lineOverride, titleOverride, colorOverride, typeOverride, nextStop }:
-    { v: any, onSelect: (v: any) => void, simpleMode: boolean, showLabels: boolean, lineOverride?: string, titleOverride?: string, colorOverride?: string, typeOverride?: number, nextStop?: { name: string, time?: string } }) => {
+const VehicleMarker = React.memo(({ v, onSelect, simpleMode, showLabels, lineOverride, titleOverride, colorOverride, typeOverride, nextStop, delayOverride }:
+    { v: any, onSelect: (v: any) => void, simpleMode: boolean, showLabels: boolean, lineOverride?: string, titleOverride?: string, colorOverride?: string, typeOverride?: number, nextStop?: { name: string, time?: string }, delayOverride?: number | null }) => {
     // Determine label: either line number (resolved) or just '?'
     let lineLabel = lineOverride || v.line || '?';
 
-    const rawDest = v.dest || '';
+    const rawDest = titleOverride || v.dest || '';
     const isExplicitlyNotInService = /Ej i trafik|Depå|Inställd|Ej linjesatt|Tomkörning/i.test(rawDest);
 
     // Hide line numbers if standing still/not in service
     if (isExplicitlyNotInService || lineLabel === '?') {
         lineLabel = '-';
     }
+    // Visa inte linjenummer som påtvingade 2-siffror (01, 03) – normalisera till 1, 3, 30, 103 osv.
+    lineLabel = normalizeLineDisplay(lineLabel);
 
     // Resolve mode based on typeOverride (GTFS route_type) or fallback
     let mode = v.transportMode ?? 'BUS'; // 1 = Metro, handled below via mapService transportMode map or direct typeOverride
@@ -640,7 +673,10 @@ const VehicleMarker = React.memo(({ v, onSelect, simpleMode, showLabels, lineOve
 
     const color = colorOverride || v.bgColor || (mode === 'TRAM' || mode === 'METRO' ? '#14b8a6' : mode === 'TRAIN' ? '#d946ef' : '#0ea5e9');
 
-    // For simple mode (dots), keep it fast
+    const hasDestination = titleOverride && titleOverride.startsWith('Mot ');
+    const tooltipText = hasDestination ? `Linje ${lineLabel} · ${titleOverride}` : (titleOverride || `Linje ${lineLabel}`);
+    const destForIcon = hasDestination ? titleOverride : (titleOverride && !titleOverride.startsWith('Linje ') && !titleOverride.startsWith('Tåg ') ? titleOverride : undefined);
+
     if (simpleMode) {
         return (
             <CircleMarker
@@ -649,6 +685,7 @@ const VehicleMarker = React.memo(({ v, onSelect, simpleMode, showLabels, lineOve
                 pathOptions={{ fillColor: color, color: '#fff', weight: 1, opacity: 0.8, fillOpacity: 1 }}
                 eventHandlers={{ click: () => onSelect(v) }}
             >
+                <Tooltip permanent={false} direction="top">{tooltipText}</Tooltip>
                 {titleOverride && <Popup>{titleOverride}</Popup>}
             </CircleMarker>
         );
@@ -657,12 +694,14 @@ const VehicleMarker = React.memo(({ v, onSelect, simpleMode, showLabels, lineOve
     return (
         <AnimatedMarker
             position={[v.lat, v.lng]}
-            icon={getIcon(lineLabel, v.bearing ?? 0, mode, color, v.operator)}
+            icon={getIcon(lineLabel, v.bearing ?? 0, mode, color, v.operator, destForIcon, delayOverride)}
             eventHandlers={{ click: () => onSelect(v) }}
-            title={titleOverride || `Linje ${lineLabel}`}
+            title={tooltipText}
             speed={v.speed}
             bearing={v.bearing ?? 0}
-        />
+        >
+            <Tooltip permanent={false} direction="top">{tooltipText}</Tooltip>
+        </AnimatedMarker>
     );
 }, (prev, next) =>
     prev.v.id === next.v.id &&
@@ -671,6 +710,7 @@ const VehicleMarker = React.memo(({ v, onSelect, simpleMode, showLabels, lineOve
     prev.v.bearing === next.v.bearing &&
     prev.simpleMode === next.simpleMode &&
     prev.lineOverride === next.lineOverride &&
+    prev.delayOverride === next.delayOverride &&
     prev.titleOverride === next.titleOverride &&
     prev.colorOverride === next.colorOverride &&
     prev.nextStop?.name === next.nextStop?.name
@@ -680,26 +720,38 @@ const VehicleMarker = React.memo(({ v, onSelect, simpleMode, showLabels, lineOve
 import { MapService } from '../services/mapService';
 
 // ── Map Events Controller
-const MapEvents = ({ setVehicles, setStops, setParkings, setDisruptions, selectedOperator, setZoom, setIsLoading }: {
+const MapEvents = ({ setVehicles, setStops, setParkings, setDisruptions, selectedOperator, setZoom, setIsLoading, setFollowUser, refreshVehiclesTrigger, onGtfsStaticLoaded }: {
     setVehicles: (v: any[]) => void,
     setStops: (s: any[]) => void,
     setParkings: (p: any[]) => void,
     setDisruptions: (d: any[]) => void,
     selectedOperator?: string,
     setZoom: (z: number) => void,
-    setIsLoading: (l: boolean) => void
+    setIsLoading: (l: boolean) => void,
+    setFollowUser?: (v: boolean) => void,
+    refreshVehiclesTrigger?: number,
+    onGtfsStaticLoaded?: () => void
 }) => {
     const map = useMap();
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const fetchCountRef = useRef(0);
+    const vehicleCacheRef = useRef<{ data: any[]; timestamp: number }>({ data: [], timestamp: 0 });
 
     useEffect(() => {
         if (selectedOperator) {
             setVehicles([]);
+            vehicleCacheRef.current = { data: [], timestamp: 0 };
             const op = TRAFIKLAB_OPERATORS.find(o => o.id === selectedOperator);
             if (op && op.lat && op.lng) map.setView([op.lat, op.lng], 9);
         }
     }, [selectedOperator, map]);
+
+    // GTFS Sweden 3 Static – en request per 23h, linjedata för alla län; refetch vehicles when loaded so lines resolve
+    useEffect(() => {
+        GtfsSwedenStaticService.preload();
+        if (onGtfsStaticLoaded) GtfsSwedenStaticService.onGtfsSwedenStaticLoaded(onGtfsStaticLoaded);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // ── Smart Regional Preloading ──────────────────────────────────────────────
     // Automatically load NeTEx static data for the region in view so line badges + destinations appear.
@@ -713,7 +765,7 @@ const MapEvents = ({ setVehicles, setStops, setParkings, setDisruptions, selecte
             if (lat > 58.7 && lat < 60.3 && lng > 17.0 && lng < 19.5) GtfsShapeService.preload('sl');
             if (lat > 59.2 && lat < 60.7 && lng > 16.9 && lng < 18.2) GtfsShapeService.preload('ul');
             if (lat > 55.2 && lat < 56.5 && lng > 12.4 && lng < 14.6) GtfsShapeService.preload('skane');
-            if (lat > 57.0 && lat < 58.5 && lng > 11.5 && lng < 13.5) GtfsShapeService.preload('vasttrafik');
+            if (lat > 57.0 && lat < 59.0 && lng > 11.0 && lng < 13.5) GtfsShapeService.preload('vasttrafik');
             if (lat > 57.1 && lat < 58.2 && lng > 13.5 && lng < 15.6) GtfsShapeService.preload('jlt');       // Jönköping ← SAKNADES!
             if (lat > 57.7 && lat < 58.9 && lng > 14.5 && lng < 16.9) GtfsShapeService.preload('otraf');     // Östergötland
             if (lat > 58.6 && lat < 60.2 && lng > 14.1 && lng < 15.9) GtfsShapeService.preload('orebro');
@@ -753,18 +805,26 @@ const MapEvents = ({ setVehicles, setStops, setParkings, setDisruptions, selecte
 
         try {
             if (zoom > 8) {
-                // Use MapService
-                const vehicleData = await MapService.getVehiclePositions(
-                    bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(), selectedOperator
-                );
-                setVehicles(vehicleData || []);
+                const now = Date.now();
+                const cacheFresh = vehicleCacheRef.current.timestamp > 0 && (now - vehicleCacheRef.current.timestamp) < VEHICLE_CACHE_TTL_MS;
+                let vehicleData: any[];
+                if (cacheFresh && vehicleCacheRef.current.data.length >= 0) {
+                    vehicleData = vehicleCacheRef.current.data;
+                    setVehicles(vehicleData);
+                } else {
+                    vehicleData = await MapService.getVehiclePositions(
+                        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(), selectedOperator
+                    );
+                    vehicleCacheRef.current = { data: vehicleData || [], timestamp: now };
+                    setVehicles(vehicleData || []);
 
-                // Feed LiveLineResolver for real-time destination tracking
-                if (vehicleData) LiveLineResolver.feedVehicles(vehicleData);
+                    // Feed LiveLineResolver for real-time destination tracking
+                    if (vehicleData) LiveLineResolver.feedVehicles(vehicleData);
+                }
 
                 // Fetch stops (no zoom limit, "gör de ändå!")
                 if (zoom > 12) {
-                    const opArray = ['sl', 'skane', 'ul', 'otraf', 'jlt', 'krono', 'klt', 'gotland', 'varm', 'orebro', 'vastmanland', 'dt', 'xt', 'dintur', 'halland'];
+                    const opArray = ['sl', 'skane', 'vasttrafik', 'ul', 'otraf', 'jlt', 'krono', 'klt', 'gotland', 'varm', 'orebro', 'vastmanland', 'dt', 'xt', 'dintur', 'halland'];
                     let allStops: any[] = [];
                     for (const op of opArray) {
                         if (GtfsShapeService.isLoaded(op)) {
@@ -788,15 +848,13 @@ const MapEvents = ({ setVehicles, setStops, setParkings, setDisruptions, selecte
                     setStops([]);
                 }
 
-                // Parkings
-                /*
+                // Parkings (Västtrafik SPP – aktiverad)
                 if (zoom > 13) {
-                     const parkingData = await MapService.getParkings(
-                         bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast()
-                     );
-                     setParkings(parkingData || []);
+                    const parkingData = await MapService.getParkings(
+                        bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast()
+                    );
+                    setParkings(parkingData || []);
                 }
-                */
             }
             // Disruptions only every ~60s (every 6th call)
             if (fetchCountRef.current % 6 === 1) {
@@ -815,16 +873,21 @@ const MapEvents = ({ setVehicles, setStops, setParkings, setDisruptions, selecte
         debounceRef.current = setTimeout(fetchMapData, 150);
     };
 
+    const onMoveEnd = () => {
+        debouncedFetch();
+        setFollowUser?.(false);
+    };
+
     useEffect(() => {
         fetchMapData();
         const interval = setInterval(fetchMapData, REFRESH_INTERVAL);
-        map.on('moveend', debouncedFetch);
+        map.on('moveend', onMoveEnd);
         return () => {
             clearInterval(interval);
             if (debounceRef.current) clearTimeout(debounceRef.current);
-            map.off('moveend', debouncedFetch);
+            map.off('moveend', onMoveEnd);
         };
-    }, [map, selectedOperator]);
+    }, [map, selectedOperator, refreshVehiclesTrigger]);
 
     return null;
 };
@@ -855,7 +918,7 @@ export const LiveMap = () => {
 
     const [zoom, setZoom] = useState<number>(13);
     const [activeFilters, setActiveFilters] = useState<string[]>(['BUS', 'TRAM', 'METRO', 'TRAIN', 'FERRY']);
-    const [hideDepot, setHideDepot] = useState(true); // Default: visa bara fordon i trafik
+    const [hideDepot, setHideDepot] = useState(false); // Default: visa alla fordon (inkl. depå)
     const [showLabels, setShowLabels] = useState(false); // Toggle for showing vehicle IDs
     const [showLayers, setShowLayers] = useState(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
@@ -870,13 +933,50 @@ export const LiveMap = () => {
     const [gtfsPayload, setGtfsPayload] = useState<VehicleRoutePayload | null>(null);
     const [gtfsLoading, setGtfsLoading] = useState(false);
     const [nextStopCache, setNextStopCache] = useState<Record<string, { name: string, time?: string }>>({});
+    const [destinationCache, setDestinationCache] = useState<Record<string, string>>({});
     const [mapMode, setMapMode] = useState<'light' | 'dark' | 'satellite' | 'hybrid'>('light'); // Kartläge
     const [searchQuery, setSearchQuery] = useState<string>(''); // Sökning på internummer
     const [mapRef, setMapRef] = useState<L.Map | null>(null);
     const [tripDelay, setTripDelay] = useState<number | null>(null);
     const [resolvedNextStop, setResolvedNextStop] = useState<string | null>(null);
+    const [userPosition, setUserPosition] = useState<{ lat: number; lng: number } | null>(null);
+    const [userPositionError, setUserPositionError] = useState<string | null>(null);
+    const [followUser, setFollowUser] = useState(false);
+    const [refreshVehiclesTrigger, setRefreshVehiclesTrigger] = useState(0);
+    const [gtfsDestinationIndexes, setGtfsDestinationIndexes] = useState<GtfsIndexes | null>(null);
 
     const [gtfsCounter, setGtfsCounter] = useState(0);
+
+    // Ladda static GTFS-index för destination (trips, stop_times, stops) – används av resolveDestination
+    useEffect(() => {
+        GtfsDestinationService.loadGtfsIndexes().then(setGtfsDestinationIndexes);
+    }, []);
+
+    // Uppdatera popupens position och koppling till rätt fordon vid varje fordonsrefresh (popup följer fordonet)
+    const updateVehiclePopup = React.useCallback(
+        (vehicleId: string, newLatLng: { lat: number; lng: number }, _resolvedDestination: string) => {
+            setSelectedVehicle((prev: any) => {
+                if (!prev || prev.id !== vehicleId) return prev;
+                return { ...prev, lat: newLatLng.lat, lng: newLatLng.lng };
+            });
+        },
+        []
+    );
+
+    useEffect(() => {
+        if (!selectedVehicle || vehicles.length === 0) return;
+        const live = vehicles.find((v) => v.id === selectedVehicle.id);
+        if (live && (live.lat !== selectedVehicle.lat || live.lng !== selectedVehicle.lng)) {
+            updateVehiclePopup(selectedVehicle.id, { lat: live.lat, lng: live.lng }, '');
+        }
+    }, [vehicles, selectedVehicle?.id, updateVehiclePopup]);
+
+    // Fyll TripUpdates-cache när popup öppnas så resolveDestination får realtime headsign/lastStopId
+    useEffect(() => {
+        if (!selectedVehicle?.tripId) return;
+        const op = selectedVehicle.operator || selectedOperator;
+        TrafiklabService.getTripUpdate(op, selectedVehicle.tripId).catch(() => {});
+    }, [selectedVehicle?.id, selectedVehicle?.tripId, selectedVehicle?.operator, selectedOperator]);
 
     // Register progress callback to re-render when static data finishes indexing
     useEffect(() => {
@@ -885,6 +985,36 @@ export const LiveMap = () => {
         };
         GtfsShapeService.onProgress(handleProgress);
     }, []);
+
+    // ── Användarposition (geolokalisering) ──
+    useEffect(() => {
+        if (!navigator.geolocation) {
+            setUserPositionError('Geolokalisering stöds inte');
+            return;
+        }
+        setUserPositionError(null);
+
+        const onSuccess = (pos: GeolocationPosition) => {
+            setUserPosition({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+            setUserPositionError(null);
+        };
+        const onError = (err: GeolocationPositionError) => {
+            setUserPositionError(err.code === 1 ? 'Tillåt plats i webbläsaren' : 'Kunde inte hämta position');
+        };
+
+        const watchId = navigator.geolocation.watchPosition(onSuccess, onError, {
+            enableHighAccuracy: true,
+            maximumAge: 15000,
+            timeout: 10000
+        });
+        return () => navigator.geolocation.clearWatch(watchId);
+    }, []);
+
+    // Följ användaren när followUser är på
+    useEffect(() => {
+        if (!followUser || !mapRef || !userPosition) return;
+        mapRef.setView([userPosition.lat, userPosition.lng], mapRef.getZoom());
+    }, [followUser, mapRef, userPosition?.lat, userPosition?.lng]);
 
     // ── Load Full Network Shapes ────────────────────────────────────────────────
     useEffect(() => {
@@ -939,10 +1069,20 @@ export const LiveMap = () => {
             vehicles.flatMap(v => getOperatorCandidates(v, selectedOperator))
         ));
 
-        // 1. Trigger preload (fire-and-forget, doesn't return a promise)
-        operators.forEach(op => {
-            GtfsShapeService.preload(op);
-        });
+        // 1. Trigger preload for all relevant operators on screen.
+        // For a specific region: preload that operator.
+        // For 'sweden' mode: preload each unique operator actually present in the vehicle list (max 4 at a time).
+        if (selectedOperator && selectedOperator !== 'sweden' && SUPPORTED_STATIC_OPERATORS.has(selectedOperator)) {
+            GtfsShapeService.preload(selectedOperator);
+        } else if (selectedOperator === 'sweden') {
+            // Preload the operators present in the current vehicle set (capped to avoid rate limits)
+            const uniqueOps = Array.from(new Set(
+                vehicles
+                    .map(v => String(v?.operator || '').toLowerCase())
+                    .filter(op => op && SUPPORTED_STATIC_OPERATORS.has(op))
+            )).slice(0, 4); // Max 4 at a time to avoid API rate limits
+            uniqueOps.forEach(op => GtfsShapeService.preload(op));
+        }
 
         // 2. Poll for route maps (so line numbers appear ASAP)
         const checkMaps = () => {
@@ -1001,6 +1141,46 @@ export const LiveMap = () => {
         });
     }, [vehicles, selectedOperator]); // Re-run when vehicles/operator changes
 
+    // ── Destination från TripUpdates (lastStopId → namn) + cache ──
+    // Först ladda TripUpdates per operatör (ett anrop per op fyller cachen med alla resor), sedan lös lastStopId → namn.
+    useEffect(() => {
+        const operatorsNeedingTu = Array.from(new Set(vehicles.filter(v => v.tripId && v.operator).map(v => v.operator as string)));
+
+        (async () => {
+            for (const op of operatorsNeedingTu) {
+                if (!op || op === 'sweden' || op === 'entur') continue;
+                const one = vehicles.find(v => v.operator === op && v.tripId);
+                if (one) await TrafiklabService.getTripUpdate(op, one.tripId!).catch(() => {});
+            }
+
+            const needDest = vehicles.filter(v => v.tripId && (!v.dest || isUselessDestination(v.dest, v.line)));
+            const stopIdsToPrefetch: string[] = [];
+            const toResolve: { tripId: string; lastStopId: string; op: string }[] = [];
+
+            for (const v of needDest) {
+                const op = v.operator || selectedOperator;
+                const lastStopId = TrafiklabService.getTripLastStopIdFromCache(op, v.tripId);
+                if (!lastStopId) continue;
+                const cached = getCachedStopName(lastStopId);
+                if (cached && !GtfsDestinationService.isForbiddenDestination(cached)) {
+                    setDestinationCache(prev => (prev[v.tripId] === cached ? prev : { ...prev, [v.tripId]: cached }));
+                } else if (!cached) {
+                    stopIdsToPrefetch.push(lastStopId);
+                    toResolve.push({ tripId: v.tripId, lastStopId, op });
+                }
+            }
+            prefetchStopNames(stopIdsToPrefetch);
+
+            toResolve.slice(0, 30).forEach(({ tripId, lastStopId }) => {
+                resolveStopName(lastStopId).then(name => {
+                    if (name && !GtfsDestinationService.isForbiddenDestination(name)) {
+                        setDestinationCache(prev => (prev[tripId] === name ? prev : { ...prev, [tripId]: name }));
+                    }
+                });
+            });
+        })();
+    }, [vehicles, selectedOperator]);
+
     const toggleDark = () => {
 
         const next = !document.documentElement.classList.contains('dark');
@@ -1029,7 +1209,7 @@ export const LiveMap = () => {
         setTripDelay(null);
         setResolvedNextStop(null);
 
-        // ── Fetch TripUpdates for delay info + next stop ──
+        // ── Fetch TripUpdates for delay info + next stop + destination (last stop) ──
         if (v.tripId && v.operator) {
             TrafiklabService.getTripUpdate(v.operator, v.tripId).then(async tu => {
                 if (tu) {
@@ -1038,6 +1218,13 @@ export const LiveMap = () => {
                     if (tu.nextStopId) {
                         const name = await resolveStopName(tu.nextStopId);
                         if (name) setResolvedNextStop(name);
+                    }
+                    // Resolve destination (last stop) so popup can show it – skriv aldrig "—" eller "Ej angiven hållplats"
+                    if (tu.lastStopId) {
+                        const destName = await resolveStopName(tu.lastStopId);
+                        if (destName && !GtfsDestinationService.isForbiddenDestination(destName)) {
+                            setDestinationCache(prev => (prev[v.tripId] === destName ? prev : { ...prev, [v.tripId]: destName }));
+                        }
                     }
                 }
             }).catch(() => { });
@@ -1146,6 +1333,36 @@ export const LiveMap = () => {
         }
     };
 
+    // När användaren klickar på ett fordon: ladda nätverkslinjer för operatören om vi inte redan har rutten (t.ex. vid "Sverige"-vy)
+    useEffect(() => {
+        const v = selectedVehicle;
+        if (!v?.operator || !v?.line || v.line === '?') return;
+        const lineCode = String(v.line).trim();
+        const hasMatchingShape = Object.values(networkShapes).some(s => s.publicCode === lineCode);
+        if (hasMatchingShape) return; // redan ritad från networkShapes
+
+        let cancelled = false;
+        (async () => {
+            if (!GtfsShapeService.isLoaded(v.operator)) GtfsShapeService.preload(v.operator);
+            let attempts = 0;
+            while (!GtfsShapeService.isLoaded(v.operator) && attempts < 25 && !cancelled) {
+                await new Promise(r => setTimeout(r, 400));
+                attempts++;
+            }
+            if (cancelled) return;
+            try {
+                const shapes = await GtfsShapeService.getAllNetworkShapes(v.operator);
+                if (cancelled) return;
+                const matching = Object.values(shapes).find(s => s.publicCode === lineCode);
+                if (matching?.points?.length) {
+                    const coords = matching.points.flatMap(seg => seg);
+                    if (coords.length >= 2) setJourneyPath(coords);
+                }
+            } catch (_) { /* ignore */ }
+        })();
+        return () => { cancelled = true; };
+    }, [selectedVehicle?.id, selectedVehicle?.operator, selectedVehicle?.line, networkShapes]);
+
     useEffect(() => {
         if (selectedParking) {
             setParkingImage(null);
@@ -1193,6 +1410,25 @@ export const LiveMap = () => {
 
                 <MapRefCapture setMapRef={setMapRef} />
 
+                {/* Användarposition (blå prick) */}
+                {userPosition && (
+                    <CircleMarker
+                        center={[userPosition.lat, userPosition.lng]}
+                        radius={8}
+                        pathOptions={{
+                            fillColor: '#3b82f6',
+                            color: '#ffffff',
+                            weight: 2,
+                            opacity: 1,
+                            fillOpacity: 1
+                        }}
+                    >
+                        <Popup closeButton={false}>
+                            <div className="font-sans text-xs font-bold text-slate-700">Din position</div>
+                        </Popup>
+                    </CircleMarker>
+                )}
+
                 <MapEvents
                     setVehicles={setVehicles}
                     setStops={setStops}
@@ -1201,6 +1437,9 @@ export const LiveMap = () => {
                     selectedOperator={selectedOperator}
                     setZoom={setZoom}
                     setIsLoading={setIsLoading}
+                    setFollowUser={setFollowUser}
+                    refreshVehiclesTrigger={refreshVehiclesTrigger}
+                    onGtfsStaticLoaded={() => setRefreshVehiclesTrigger(v => v + 1)}
                 />
 
                 {/* Journey Path */}
@@ -1315,7 +1554,14 @@ export const LiveMap = () => {
                         const isValidCoord = v.lat >= 54 && v.lat <= 71 && v.lng >= 9 && v.lng <= 25;
                         return isValidCoord;
                     })
-                    .filter(v => activeFilters.includes(v.transportMode || 'BUS'))
+                    .filter(v => {
+                        const mode = v.transportMode || 'BUS';
+                        if (activeFilters.includes(mode)) return true;
+                        // Visa okända fordonsslag – filtrera inte bort dem
+                        const known = ['BUS', 'TRAM', 'METRO', 'TRAIN', 'FERRY'];
+                        if (!known.includes(mode)) return true;
+                        return false;
+                    })
                     .filter(v => {
                         // Depot filter - improved logic
                         if (!hideDepot) return true;
@@ -1363,7 +1609,11 @@ export const LiveMap = () => {
 
                         const likelyTrain = isLikelyTrainVehicle(v, info?.routeType);
 
-                        let resolvedLine = info?.line || v.line;
+                        // Prioritera fordonets eget linjenummer (från feed/pickLineDisplay). Örebro: använd endast v.line, ignorera NeTEx/GTFS (ger ofta fel 34).
+                        const isOrebro = (v.operator || selectedOperator || '').toLowerCase() === 'orebro';
+                        let resolvedLine: string | null = (v.line && looksLikeLineNumber(v.line)) ? v.line : null;
+                        if (!resolvedLine && !isOrebro && info?.line && looksLikeLineNumber(info.line)) resolvedLine = info.line;
+                        if (!resolvedLine || resolvedLine.trim() === '') resolvedLine = '?';
                         if (!showLabels && likelyTrain) {
                             const trainNo = getTrainNumberFromVehicleId(v);
                             if (trainNo && (!resolvedLine || resolvedLine === '?' || /^[0-9]{8,}$/.test(String(resolvedLine)))) {
@@ -1379,14 +1629,52 @@ export const LiveMap = () => {
                             } else {
                                 resolvedLine = 'ID?';
                             }
+                        } else if (resolvedLine && resolvedLine !== '?') {
+                            // Inga 2-siffriga linjesiffror: "03" → "3", "09" → "9". "34" och "103" oförändrade.
+                            resolvedLine = normalizeLineDisplay(resolvedLine);
                         }
 
-                        // Strict priority fallback: realtime > static > route_long_name > route_short_name
-                        const resolvedHeadsign =
-                            (!isUselessDestination(v.dest, v.line) ? v.dest : null) ||
-                            info?.headsign ||
-                            info?.longName ||
-                            (resolvedLine && resolvedLine !== '?' ? `${likelyTrain ? 'Tåg' : 'Linje'} ${resolvedLine}` : null);
+                        // Destination: GTFS Sweden 3 Static först (korrekta destinationer). Inga gamla filter ska överskugga static.
+                        const sameLineAsInfo = info?.line && resolvedLine && String(info.line).trim() === String(resolvedLine).trim();
+                        const infoHeadsign = sameLineAsInfo ? (info?.headsign ?? null) : null;
+                        const infoLongName = sameLineAsInfo ? (info?.longName ?? null) : null;
+                        const trackedDests = (resolvedLine && resolvedLine !== '?' && (v.operator || selectedOperator))
+                            ? LiveLineResolver.getDestinations(v.operator || selectedOperator || 'sl', resolvedLine)
+                            : [];
+                        const opForTrip = getOperatorCandidates(v, selectedOperator)[0] ?? v.operator ?? selectedOperator;
+                        const tuCache = TrafiklabService.getTripUpdatesCache(opForTrip);
+                        const tuForDest = tuCache.length ? tuCache : null;
+                        let rawDest: string | null = null;
+                        if (gtfsDestinationIndexes && (v.tripId || v.routeId)) {
+                            const strictDest = GtfsDestinationService.resolveDestinationStrict(v, tuForDest, gtfsDestinationIndexes, resolvedLine ?? null);
+                            if (strictDest && !GtfsDestinationService.isForbiddenDestination(strictDest)) rawDest = strictDest;
+                        }
+                        if (rawDest == null || GtfsDestinationService.isForbiddenDestination(rawDest)) {
+                            rawDest =
+                                (!isUselessDestination(v.dest, v.line) ? v.dest : null) ||
+                                infoHeadsign ||
+                                destinationCache[v.tripId] ||
+                                (trackedDests.length > 0 ? trackedDests[0] : null) ||
+                                infoLongName ||
+                                (gtfsDestinationIndexes && (v.tripId || v.routeId)
+                                    ? GtfsDestinationService.resolveDestinationStrict(v, tuForDest, gtfsDestinationIndexes, resolvedLine ?? null)
+                                    : null) ||
+                                null;
+                        }
+                        // Visa aldrig "Okänd destination" på kartikonerna – använd "Linje X" / "Tåg X" istället
+                        if (rawDest && /okänd\s+destination/i.test(rawDest)) rawDest = '';
+                        const resolvedHeadsign = rawDest
+                            ? (rawDest.startsWith('Mot ') ? rawDest : `Mot ${rawDest}`)
+                            : (resolvedLine && resolvedLine !== '?' ? `${likelyTrain ? 'Tåg' : 'Linje'} ${resolvedLine}` : null);
+
+                        // Mata in lösta destinationer så andra fordon på samma linje kan använda dem
+                        const destForTracking = rawDest ? rawDest.replace(/^Mot\s+/i, '').trim() : '';
+                        if (destForTracking && resolvedLine && resolvedLine !== '?' && (v.operator || selectedOperator)) {
+                            LiveLineResolver.feedDestination(v.operator || selectedOperator || 'sl', resolvedLine, destForTracking);
+                        }
+
+                        const tuMatch = v.tripId ? tuCache.find((e: { tripId: string }) => e.tripId === v.tripId) : null;
+                        const delayOverride = tuMatch?.delay ?? undefined;
 
                         return (
                             <VehicleMarker
@@ -1396,10 +1684,11 @@ export const LiveMap = () => {
                                 simpleMode={vehicles.length > 200 || zoom < 13}
                                 showLabels={showLabels}
                                 lineOverride={resolvedLine}
-                                titleOverride={resolvedHeadsign}
+                                titleOverride={resolvedHeadsign ?? undefined}
                                 colorOverride={info?.color}
                                 typeOverride={info?.routeType ?? (likelyTrain ? 2 : undefined)}
                                 nextStop={v.tripId ? nextStopCache[v.tripId] : undefined}
+                                delayOverride={delayOverride}
                             />
                         );
                     })}
@@ -1480,26 +1769,37 @@ export const LiveMap = () => {
                 const likelyTrain = isLikelyTrainVehicle(selectedVehicle, routeType);
 
                 const trainNo = getTrainNumberFromVehicleId(selectedVehicle);
+                const staticLine = GtfsSwedenStaticService.getLineSync(selectedVehicle.tripId, selectedVehicle.routeId);
                 const displayLine =
                     gtfsPayload?.line ||
                     routeInfo?.shortName ||
-                    ((likelyTrain && trainNo) ? trainNo : (selectedVehicle.line || null));
+                    ((likelyTrain && trainNo) ? trainNo : null) ||
+                    syncInfo?.line ||
+                    staticLine ||
+                    selectedVehicle.line ||
+                    null;
 
                 const cachedNextStopRaw = selectedVehicle.tripId ? (nextStopCache[selectedVehicle.tripId]?.name || null) : null;
                 const cachedHeadsign = cachedNextStopRaw?.match(/^Mot\s+(.+)$/i)?.[1] || null;
                 const cachedNextStopName = cachedHeadsign ? null : cachedNextStopRaw;
 
-                const displayDest = gtfsPayload?.destination
-                    || gtfsPayload?.tripHeadsign
-                    || selectedVehicle.dest
-                    || cachedHeadsign
-                    || syncInfo?.headsign
-                    || syncInfo?.longName
-                    || routeInfo?.longName
-                    || null;
+                // Samma källor som på kartikonen: GTFS payload, cache, LiveLineResolver, NeTEx. Ignorera "Ej linjesatt" från API.
+                // Obligatorisk destination från Trafiklab-kedjan (realtime.headsign → trips.trip_headsign → stop_times_last_stop → route_fallback)
+                const operatorForTrip = opCandidates[0] ?? selectedVehicle.operator ?? selectedOperator;
+                const tripUpdates = TrafiklabService.getTripUpdatesCache(operatorForTrip);
+                const resolved = GtfsDestinationService.resolveDestination(
+                    selectedVehicle,
+                    tripUpdates.length ? tripUpdates : null,
+                    gtfsDestinationIndexes,
+                    displayLine
+                );
+                // Tvingande destination: aldrig "—" eller "Ej angiven hållplats". Vid sådant kör resolveDestinationStrict.
+                let finalDest = (resolved.destination || '').trim() || 'Hämtar destination...';
+                if (GtfsDestinationService.isForbiddenDestination(finalDest)) {
+                    finalDest = GtfsDestinationService.resolveDestinationStrict(selectedVehicle, tripUpdates.length ? tripUpdates : null, gtfsDestinationIndexes, displayLine);
+                }
 
                 const displayColor = routeInfo?.color || syncInfo?.color || journeyColor;
-                const finalDest = displayDest || null;
 
                 // ── Next stop resolution (multiple sources) ──
                 let nextStopDisplay: string | null = null;
@@ -1567,6 +1867,7 @@ export const LiveMap = () => {
                         numColor={numColor}
                         nextStopDisplay={nextStopDisplay}
                         nextPlatform={nextPlatform}
+                        destinationText={finalDest}
                         gtfsLoading={gtfsLoading}
                         onClose={() => { setSelectedVehicle(null); setJourneyPath([]); }}
                         mapRef={mapRef}
@@ -1578,12 +1879,35 @@ export const LiveMap = () => {
             {/* ── Compact Top Control Bar ── */}
             <div className="absolute top-3 right-3 z-[1000] flex items-center gap-2 pointer-events-none">
 
+                {/* Centrera på mig */}
+                <div className="pointer-events-auto flex items-center gap-1.5">
+                    <button
+                        type="button"
+                        onClick={() => {
+                            if (userPosition && mapRef) {
+                                mapRef.setView([userPosition.lat, userPosition.lng], 15);
+                                setFollowUser(true);
+                            }
+                        }}
+                        disabled={!userPosition || !!userPositionError}
+                        title={userPositionError || (userPosition ? 'Centrera kartan på min position' : 'Hämtar position...')}
+                        className="h-9 w-9 rounded-full shadow-lg border border-white/20 backdrop-blur-xl bg-white/80 dark:bg-slate-900/80 flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-sky-100 dark:hover:bg-sky-900/40 hover:text-sky-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all active:scale-90"
+                    >
+                        <FontAwesomeIcon icon={faLocationArrow} className="text-sm" />
+                    </button>
+                    {userPositionError && (
+                        <span className="text-[10px] font-semibold text-amber-600 dark:text-amber-400 max-w-[100px] truncate" title={userPositionError}>
+                            {userPositionError}
+                        </span>
+                    )}
+                </div>
+
                 {/* Search box */}
-                <div className="pointer-events-auto flex items-center gap-1.5 h-9 px-3 rounded-full shadow-lg border border-white/20 backdrop-blur-xl bg-white/80 dark:bg-slate-900/80 max-w-[180px]">
-                    <FontAwesomeIcon icon={faSearch} className="text-slate-400 text-xs" />
+                <div className="pointer-events-auto flex items-center gap-1.5 h-9 px-3 rounded-full shadow-lg border border-white/20 backdrop-blur-xl bg-white/80 dark:bg-slate-900/80 max-w-[200px]">
+                    <FontAwesomeIcon icon={faSearch} className="text-slate-400 text-xs shrink-0" />
                     <input
                         type="text"
-                        placeholder="Sök internr..."
+                        placeholder="Sök linje, fordonsnr, operatör..."
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                         className="bg-transparent font-semibold text-slate-800 dark:text-white text-xs outline-none placeholder-slate-400 dark:placeholder-slate-500 min-w-0 flex-1"
@@ -1598,21 +1922,30 @@ export const LiveMap = () => {
                     )}
                 </div>
 
-                {/* Operator pill */}
-                <div className="pointer-events-auto flex items-center gap-1.5 h-9 px-2 rounded-full shadow-lg border border-white/20 backdrop-blur-xl bg-white/80 dark:bg-slate-900/80">
-                    <div className="w-5 h-5 rounded-full bg-gradient-to-br from-sky-400 to-blue-600 flex items-center justify-center shrink-0">
+                {/* Län / Region väljare (grupperad) */}
+                <div className="pointer-events-auto flex items-center gap-1.5 h-9 pl-2 pr-1.5 rounded-full shadow-lg border border-white/20 backdrop-blur-xl bg-white/80 dark:bg-slate-900/80 min-w-[140px]">
+                    <div className="w-5 h-5 rounded-full bg-gradient-to-br from-sky-400 to-blue-600 flex items-center justify-center shrink-0" title="Välj län">
                         <FontAwesomeIcon icon={faLocationArrow} className={`text-white text-[8px] ${isLoading ? 'animate-spin' : ''}`} />
                     </div>
                     <select
                         value={selectedOperator}
                         onChange={(e) => setSelectedOperator(e.target.value)}
-                        className="bg-transparent font-bold text-slate-800 dark:text-white text-xs outline-none appearance-none cursor-pointer max-w-[130px]"
+                        className="bg-transparent font-bold text-slate-800 dark:text-white text-xs outline-none appearance-none cursor-pointer flex-1 min-w-0"
+                        title="Välj region / län"
                     >
-                        {TRAFIKLAB_OPERATORS.map(op => (
-                            <option key={op.id} value={op.id} className="text-slate-800">{op.name}</option>
-                        ))}
+                        {OPERATOR_REGIONS.map(reg => {
+                            const ops = TRAFIKLAB_OPERATORS.filter((o: { region?: string }) => o.region === reg.key);
+                            if (ops.length === 0) return null;
+                            return (
+                                <optgroup key={reg.key} label={reg.label}>
+                                    {ops.map((op: { id: string; name: string }) => (
+                                        <option key={op.id} value={op.id} className="text-slate-800 dark:text-slate-200">{op.name}</option>
+                                    ))}
+                                </optgroup>
+                            );
+                        })}
                     </select>
-                    <FontAwesomeIcon icon={faChevronDown} className="text-slate-400 text-[9px] pointer-events-none -ml-1" />
+                    <FontAwesomeIcon icon={faChevronDown} className="text-slate-400 text-[9px] pointer-events-none shrink-0" />
                 </div>
 
                 {/* Vehicle count pill */}

@@ -13,9 +13,9 @@ import { EnturService } from './enturService';
 // Actually, I can export getVasttrafikToken from transitService? No, it's not exported.
 // I will create a robust token fetcher here too.
 
-// ── Smart Caching System ──
+// ── Smart Caching System (BKT-stil: 5s cache för färre anrop vid pan/zoom) ──
 const vehicleCache = new Map<string, { data: any[], timestamp: number }>();
-const CACHE_TTL = 3000; // 3 seconds cache for vehicle data
+const CACHE_TTL = 5000; // 5 seconds – som BKT busmap
 const MAX_VEHICLES_PER_REGION = 2000; // Prevent massive data transfers
 
 // ── GPS Validation Helper ──
@@ -155,7 +155,7 @@ export const MapService = {
                 bearing: v.bearing,
                 speed: v.speed,
                 line: v.line,
-                dest: v.direction, // Will be mapped to tripHeadsign later
+                dest: v.dest ?? v.direction ?? '', // trip_headsign från GTFS-RT eller direction
                 transportMode: (() => {
                     const t = String(v.type || '').toUpperCase();
                     if (t === 'TRAM' || t === 'TRAIN' || t === 'FERRY' || t === 'METRO') return t;
@@ -296,26 +296,9 @@ export const MapService = {
     },
 
     /**
-     * Get Traffic Disruptions (Trafikverket).
-     * Proxies to TransitService or implements directly?
-     * The user asked for isolation. Let's implement getting disruptions directly here or use a dedicated helper.
-     * We'll implement a clean fetch for disruptions here to be self-contained.
+     * Get Traffic Disruptions. (Trafikverket API exkluderad – returnerar tom lista.)
      */
     getDisruptions: async (): Promise<any[]> => {
-        // We can use the generic TrafikverketService if available, or just keeping it simple.
-        // Let's import TrafikverketService dynamically to avoid circular dep issues if any.
-        const { TrafikverketService } = await import('./trafikverketService');
-        const raw = await TrafikverketService.getDisruptions();
-
-        return raw.map(r => ({
-            situationNumber: r.id,
-            creationTime: r.updatedTime,
-            startTime: r.startTime,
-            endTime: r.endTime,
-            severity: r.severity,
-            title: r.title,
-            description: r.description,
-            coordinates: r.geometry // TrafikverketService should return geometry if updated
-        }));
+        return [];
     }
 };

@@ -39,6 +39,7 @@ export interface Departure {
   disruptionMessage?: string;
   type?: 'BUS' | 'TRAM' | 'TRAIN' | 'FERRY' | 'METRO' | 'UNK';
   serviceJourneyGid?: string;
+  lineGid?: string;
   operationalTransportIdentifiers?: any;
 }
 
@@ -55,6 +56,10 @@ export interface TrafficSituation {
   creationTime: string;
   startTime: string;
   endTime?: string;
+  /** Tid då händelsen publicerades/ändrades (t.ex. ModifiedDateTime). */
+  publishedTime?: string;
+  /** Orsakskod (t.ex. OMÄ03) från Trafikverket. */
+  reasonCode?: string;
   severity: 'severe' | 'normal' | 'slight';
   title: string;
   description: string;

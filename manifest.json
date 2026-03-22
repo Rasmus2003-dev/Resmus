@@ -1,20 +1,43 @@
 {
-  "name": "Resmus",
+  "name": "Resmus – Avgångstavlan",
   "short_name": "Resmus",
+  "description": "Realtidsavgångar och trafikinformation för Stockholm & Västra Götaland",
   "start_url": "/Resmus/",
   "scope": "/Resmus/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f172a",
+  "theme_color": "#0095eb",
+  "lang": "sv",
+  "categories": ["travel", "navigation", "utilities"],
   "icons": [
     {
       "src": "https://cdn-icons-png.flaticon.com/512/447/447031.png",
       "sizes": "192x192",
       "type": "image/png",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
       "src": "https://cdn-icons-png.flaticon.com/512/447/447031.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Avgångar",
+      "short_name": "Avgångar",
+      "description": "Visa avgångstavlan",
+      "url": "/Resmus/",
+      "icons": [{ "src": "https://cdn-icons-png.flaticon.com/512/447/447031.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Störningar",
+      "short_name": "Störningar",
+      "description": "Visa trafikstörningar",
+      "url": "/Resmus/#/disruptions",
+      "icons": [{ "src": "https://cdn-icons-png.flaticon.com/512/447/447031.png", "sizes": "192x192" }]
     }
   ]
 }

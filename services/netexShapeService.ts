@@ -16,7 +16,7 @@
  *   – Full route line draws on first click (< 1 s from cache)
  */
 
-import { API_KEYS } from './config';
+import { getNetexKeys } from './config';
 
 // ── Public types (identical contract to the old gtfsShapeService) ─────────────
 
@@ -201,7 +201,7 @@ function colorForLine(op: string, code: string, mode: string, rawColor: string, 
         if (code === '2') return { colour: '#FBB040', textColour: '#000000' };
         if (code === '3') return { colour: '#00A651', textColour: '#ffffff' };
         if (code === '4') return { colour: '#00AEEF', textColour: '#ffffff' };
-        const n = parseInt(code, 10); if (!isNaN(n) && n >= 11 && n <= 37) return { colour: '#662D91', textColour: '#ffffff' };
+        const n = parseInt(code, 10); if (!isNaN(n) && n >= 11 && n <= 99) return { colour: '#662D91', textColour: '#ffffff' };
         return { colour: base, textColour: baseText };
     }
     if (opNorm === 'sl') {
@@ -463,8 +463,8 @@ async function loadOperator(operatorId: string): Promise<void> {
     if (cache.has(operatorId)) return;
 
     const netexOpId = toNetExId(operatorId);
-    const key = API_KEYS.NETEX_STATIC_KEY;
-    const idbKey = `${netexOpId}-${key.slice(0, 8)}`;
+    const keys = getNetexKeys();
+    const idbKey = keys.length ? `${netexOpId}-${keys[0].slice(0, 8)}` : netexOpId;
 
     console.log(`[NeTEx] Loading ${operatorId}...`);
 
@@ -476,26 +476,41 @@ async function loadOperator(operatorId: string): Promise<void> {
         buf = cached.buf;
     }
 
-    // Download if not in cache or stale
-    if (!buf) {
-        const proxyUrl = import.meta.env.DEV
-            ? `/netex-static-proxy/${netexOpId}/${netexOpId}.zip?key=${key}`
-            : `https://corsproxy.io/?${encodeURIComponent(`https://opendata.samtrafiken.se/netex/${netexOpId}/${netexOpId}.zip?key=${key}`)}`;
-
-        console.log(`[NeTEx] Downloading from network: ${operatorId}`);
-        try {
-            const res = await fetch(proxyUrl);
-            if (!res.ok) {
+    // Download if not in cache or stale – prova flera nycklar vid 403/429
+    if (!buf && keys.length > 0) {
+        let lastStatus = 0;
+        for (const key of keys) {
+            const proxyUrl = import.meta.env.DEV
+                ? `/netex-static-proxy/${netexOpId}/${netexOpId}.zip?key=${key}`
+                : `https://corsproxy.io/?${encodeURIComponent(`https://opendata.samtrafiken.se/netex/${netexOpId}/${netexOpId}.zip?key=${key}`)}`;
+            console.log(`[NeTEx] Downloading from network: ${operatorId}`);
+            try {
+                const res = await fetch(proxyUrl);
+                lastStatus = res.status;
+                if (res.ok) {
+                    buf = await res.arrayBuffer();
+                    console.log(`[NeTEx] Downloaded ${(buf.byteLength / 1024 / 1024).toFixed(1)} MB for ${operatorId}`);
+                    idbSet(idbKey, buf);
+                    break;
+                }
+                if (res.status === 403 || res.status === 429) {
+                    console.warn('[NeTEx] Key quota exceeded (' + res.status + '), trying next key');
+                    continue;
+                }
                 console.error(`[NeTEx] HTTP ${res.status} for ${operatorId}`);
                 return;
+            } catch (e) {
+                console.error('[NeTEx] Network error:', e);
+                return;
             }
-            buf = await res.arrayBuffer();
-            console.log(`[NeTEx] Downloaded ${(buf.byteLength / 1024 / 1024).toFixed(1)} MB for ${operatorId}`);
-            idbSet(idbKey, buf); // Save for next session (fire and forget)
-        } catch (e) {
-            console.error('[NeTEx] Network error:', e);
+        }
+        if (!buf) {
+            console.error('[NeTEx] All keys failed (last status ' + lastStatus + ') for ' + operatorId);
             return;
         }
+    } else if (!buf) {
+        console.warn('[NeTEx] No API key configured');
+        return;
     }
 
     try {
@@ -566,9 +581,10 @@ function findJourneyLineId(tables: OperatorTables, tripId?: string | null, route
             return tailDirect;
         }
         // Suffix-based lookup (O(1) instead of loops)
-        // Most common Swedish trip tails are 8, 10, or 12 digits.
+        // Örebro: tripId = "181180000029045685" (18 digits), NeTEx numId often = last 8 or full 18
+        // Include 18, 16 so we match full GTFS trip_id when NeTEx uses it as ServiceJourney id
         if (tripId.length > 7) {
-            const lengths = [12, 10, 8, 7];
+            const lengths = [18, 16, 12, 10, 8, 7];
             for (const len of lengths) {
                 if (tripId.length >= len) {
                     const tail = tripId.slice(-len);
@@ -592,16 +608,18 @@ function findJourneyLineId(tables: OperatorTables, tripId?: string | null, route
         // Fuzzy match for long numeric route IDs (e.g. 9027170010100000 -> Line 101)
         if (/^\d{10,22}$/.test(routeId)) {
             // Swedish national format: digits 8-11 (index 7 to 11) are the zero-padded line code
-            const raw = routeId.substring(7, 11);
-            const cleaned = raw.replace(/^0+/, '');
-
-            // Try matching either '0126' or '126'
-            const candidate = tables.routeToLine.get(raw) || tables.routeToLine.get(cleaned);
-            if (candidate) {
-                tables.lookupCache.set(cacheKey, candidate);
-                return candidate;
-            } else {
-                console.debug(`[NeTEx] No match for 16-digit route ${routeId} (tried ${raw}, ${cleaned})`);
+            const slices: string[] = [
+                routeId.substring(7, 11),
+                routeId.length >= 10 ? routeId.substring(6, 10) : '',
+                routeId.length >= 8 ? routeId.substring(4, 8) : ''
+            ].filter(Boolean);
+            for (const raw of slices) {
+                const cleaned = raw.replace(/^0+/, '');
+                const candidate = tables.routeToLine.get(raw) || tables.routeToLine.get(cleaned);
+                if (candidate) {
+                    tables.lookupCache.set(cacheKey, candidate);
+                    return candidate;
+                }
             }
         }
 
@@ -644,6 +662,21 @@ function findJourneyMeta(tables: OperatorTables, tripId?: string | null): Journe
     if (tailDirect) {
         tables.journeyMeta.set(tripId, tailDirect);
         return tailDirect;
+    }
+
+    // Suffix-baserad lookup (samma som findJourneyLineId) för långa numeriska tripId (t.ex. Örebro)
+    if (tripId.length > 7 && /^\d+$/.test(tripId)) {
+        const lengths = [18, 16, 12, 10, 8, 7];
+        for (const len of lengths) {
+            if (tripId.length >= len) {
+                const suffix = tripId.slice(-len);
+                const meta = tables.journeyMeta.get(suffix);
+                if (meta) {
+                    tables.journeyMeta.set(tripId, meta);
+                    return meta;
+                }
+            }
+        }
     }
 
     const normTrip = normalizeTripKey(tripId);

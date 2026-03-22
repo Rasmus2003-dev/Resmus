@@ -1,5 +1,5 @@
 {
-  "version": "306aa47",
-  "message": "chore: format test files",
-  "timestamp": "2026-02-28T09:24:46.158Z"
+  "version": "0ef5fea",
+  "message": "Fix Örebro and JLT line display: Expand Trip ID support to 18+ digits and merge positions with TripUpdates",
+  "timestamp": "2026-03-22T09:09:27.425Z"
 }
